@@ -977,8 +977,8 @@ def recover_run(directory: Path, run_id: str) -> Job:
 def copy_job(directory: Path, destination: Path) -> Job:
     """Verified bounded snapshot, exclusive destination and report-last completion.
 
-    Includes diagnostic outputs, never follows links or copies publication staging
-    aliases. Active jobs must first finish/recover. A failed copy stays incomplete.
+    Includes opaque partial diagnostics/staging, never follows links or copies
+    publication aliases. Active jobs must first finish/recover. A failed copy stays incomplete.
     """
     root = _plain(Path(directory), directory=True)
     job = load_job(root)
@@ -987,9 +987,31 @@ def copy_job(directory: Path, destination: Path) -> Job:
     _plain(target.parent, directory=True)
     require(not target.exists() and not target.is_symlink(), "Copy destination must be fresh.")
     require(not target.is_relative_to(root) and not root.is_relative_to(target), "Overlapping copy paths.")
+    # Authority comes from committed history, not a diagnostic's .json suffix.
+    metadata = {Path("state") / f"{i:08d}.json": MAX_METADATA_BYTES
+                for i in range(1, job.revision + 1)}
+    metadata.update({Path(v.path).parent / "receipt.json": MAX_RECEIPT_BYTES for v in job.versions})
+    metadata.update({Path(name): MAX_METADATA_BYTES for name in ("incomplete.json", "import-ready.json")
+                     if (root / name).exists()})
     for run in job.runs:
-        _, sha = _read(root / "runs" / run.id / "receipt.json", MAX_RECEIPT_BYTES)
+        run_path = Path("runs") / run.id
+        receipt, sha = _read(root / run_path / "receipt.json", MAX_RECEIPT_BYTES)
         require(sha == run.receipt_sha256, "Committed run receipt hash mismatch.")
+        metadata[run_path / "receipt.json"] = MAX_RECEIPT_BYTES
+        if "legacy_evidence" in receipt:
+            metadata[Path(receipt["legacy_evidence"]["path"])] = MAX_RECEIPT_BYTES
+        else:
+            metadata[run_path / "intent.json"] = MAX_RECEIPT_BYTES
+        if run.execution == "completed" and run.operation == "scan":
+            scan = run_path / "worker" / "scan.json"
+            _, scan_sha = _read(root / scan, MAX_RECEIPT_BYTES)
+            require(scan_sha == (receipt.get("verification") or {}).get("analysis_sha256"),
+                    "Completed scan hash mismatch.")
+            metadata[scan] = MAX_RECEIPT_BYTES
+    for relative, limit in metadata.items():
+        _read(root / relative, limit)
+    require(not (root / "copy-complete.json").exists() or (root / "copy-intent.json").exists(),
+            "Copy completion requires its intent.")
     files, total, directory_count = [], 0, 0
     def traversal_error(error):
         raise error
@@ -1000,15 +1022,37 @@ def copy_job(directory: Path, destination: Path) -> Job:
         _plain(Path(base), directory=True)
         for name in directories:
             _plain(Path(base) / name, directory=True)
+        aliases = set()
         for name in names:
-            if name.startswith((".pending-", ".probe-")) or (Path(base) == root and name in ("copy-intent.json", "copy-complete.json")):
-                continue
+            if name.startswith(".pending-"):
+                info = (Path(base) / name).lstat()
+                require(stat.S_ISREG(info.st_mode) and not getattr(info, "st_file_attributes", 0)
+                        & stat.FILE_ATTRIBUTE_REPARSE_POINT, "Invalid publication staging file.")
+                if info.st_nlink == 2:
+                    aliases.add((info.st_dev, info.st_ino))
+        for name in names:
             path = Path(base) / name
-            if path.suffix == ".json":
-                _, sha = _read(path, MAX_METADATA_BYTES)
+            relative = path.relative_to(root)
+            if Path(base) == root and name in ("copy-intent.json", "copy-complete.json"):
+                continue
+            staged = name.startswith((".pending-", ".probe-"))
+            if staged and path.lstat().st_nlink > 1:
+                continue  # Retained publication alias, not separate evidence.
+            if relative in metadata:
+                _, sha = _read(path, metadata[relative])
             else:
-                _plain(path)
-                require(path.stat().st_size <= MAX_MEDIA_BYTES, "Oversized copy file.")
+                info = path.lstat()
+                if info.st_nlink == 1:
+                    _plain(path)
+                else:
+                    # Opaque reports may retain exactly one same-directory publication
+                    # alias. Other hard links remain forbidden, regardless of JSON shape.
+                    require(path.suffix == ".json" and info.st_nlink == 2
+                            and (info.st_dev, info.st_ino) in aliases
+                            and stat.S_ISREG(info.st_mode) and not getattr(info, "st_file_attributes", 0)
+                            & stat.FILE_ATTRIBUTE_REPARSE_POINT, "Hard-linked diagnostic is not a publication pair.")
+                limit = MAX_METADATA_BYTES if staged or path.suffix == ".json" else MAX_MEDIA_BYTES
+                require(info.st_size <= limit, "Oversized copy file.")
                 sha = digest(path)
             size = path.stat().st_size
             total += size

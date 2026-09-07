@@ -155,8 +155,15 @@ mutation, never silently prune. Do not edit committed files or hard-linked stagi
 `recover` checks the recorded process identity before marking dead work interrupted,
 or reconciles matching terminal receipts. It never reruns or deletes artifacts.
 `copy` rejects overlapping/existing destinations and link traversal, checks capacity,
-copies and verifies a complete snapshot, and publishes completion last. Incomplete
-copies cannot load as healthy jobs. Restore drill: copy to a fresh directory, run
+copies and verifies a complete snapshot, and publishes completion last. Committed
+state, receipts, committed scan reports and import/copy completion contracts remain strict
+JSON. Uncommitted diagnostics (including partial scan/verification reports) and unpublished
+staging files are copied as bounded opaque bytes with source/destination hash verification,
+not repaired or treated as success. JSON diagnostics and staging files retain the 1 MiB
+ceiling. An opaque JSON report may retain exactly one same-directory `.pending-*` hard-link
+alias; other diagnostic hard links are refused. Linked publication aliases are omitted,
+not independent partial evidence. Incomplete copies cannot load as healthy
+jobs. Restore drill: copy to a fresh directory, run
 `job status FRESH_DESTINATION --json` (loads/verifies source and version hashes), and
 compare IDs, hashes and feedback with the original. Use that fresh job directly; do
 not overwrite state to roll back. Same-disk snapshots/copies are **not disaster backups**.

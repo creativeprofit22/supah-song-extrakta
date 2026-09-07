@@ -488,6 +488,89 @@ def verification_receipt_checks(temp, source):
     print("PASS receipt-load rejection, immutable old worker receipts and creation-time protection", flush=True)
 
 
+def partial_diagnostic_copy_checks(temp, source):
+    root = temp / "partial-diagnostic-job"
+    job = jobs.create_job(source, root, intent="music")
+    job = jobs.commit_revision(root, replace(job,
+                               policy=replace(job.policy, max_output_bytes=16 * 1024**2)))
+    jobs.record_feedback(root, version_id=job.current_version, category="uncertain",
+                         note="Keep this exact failed-run feedback.", scope="whole",
+                         expected_revision=job.revision,
+                         expected_revision_sha256=job.revision_sha256)
+    before = cli("job", "status", root, "--json")
+    original_dump = json.dump
+    partial = b'{"status":'
+
+    def interrupted_dump(value, stream, *args, **kwargs):
+        if Path(stream.name).name == "runtime.json":
+            stream.write(partial.decode("ascii"))
+            stream.flush()
+            raise OSError("injected partial runtime diagnostic write")
+        return original_dump(value, stream, *args, **kwargs)
+
+    # One real tiny CPU worker, two numerical threads, 16 MiB / 30 seconds.
+    with patch.object(runtime.json, "dump", side_effect=interrupted_dump):
+        receipt = workflow.run_operation(root, "trim", parameters={"start_frame": 0, "end_frame": 9600},
+                                         device="cpu", timeout=30)
+    assert receipt["execution"] == "failed" and receipt["failure_kind"] == "operational"
+    assert receipt["version"] is None and receipt["runtime"] is None
+    failed = jobs.load_job(root)
+    assert failed.current_version == job.current_version and failed.versions == job.versions
+    diagnostic = Path("runs") / failed.runs[-1].id / "worker" / "runtime.json"
+    assert (root / diagnostic).read_bytes() == partial
+    status = cli("job", "status", root, "--json")
+    assert status["execution"] == "failed" and status["technical"] == "not_run"
+    assert before["execution"] == "not_run"
+    history = snapshot(root)
+    # Failed publication staging and arbitrary uncommitted diagnostics are evidence too.
+    unfinished = Path("runs") / jobs.new_id() / "worker"
+    (root / unfinished).mkdir(parents=True)
+    extras = [diagnostic.parent / "extra.json", diagnostic.parent / "scan.json",
+              unfinished / "verification.json", Path("state") / ".pending-interrupted"]
+    for relative in extras:
+        with (root / relative).open("xb") as stream:
+            stream.write(partial)
+    # A published but uncommitted report's retained alias is internal, not media sharing.
+    aliased = unfinished / "scan.json"
+    jobs._publish(root / aliased, partial)
+    extras.append(aliased)
+    copied = temp / "partial-diagnostic-copy"
+    assert jobs.copy_job(root, copied) == failed
+    assert (copied / diagnostic).read_bytes() == partial == (root / diagnostic).read_bytes()
+    assert jobs.digest(copied / diagnostic) == jobs.digest(root / diagnostic)
+    assert cli("job", "status", copied, "--json") == status
+    assert snapshot(root) == history and jobs.load_job(root) == failed
+    assert jobs.load_job(copied).feedback == failed.feedback
+    for relative in extras:
+        assert (root / relative).read_bytes() == (copied / relative).read_bytes() == partial
+    restored = temp / "partial-diagnostic-restored"
+    assert jobs.copy_job(copied, restored) == failed
+    assert (restored / diagnostic).read_bytes() == partial
+    rejected(lambda: jobs.copy_job(root, copied), contains="fresh")
+    for index, relative in enumerate((Path("state") / f"{failed.revision:08d}.json",
+                                      Path(failed.versions[0].path).parent / "receipt.json",
+                                      diagnostic.parent.parent / "receipt.json",
+                                      diagnostic.parent.parent / "intent.json",
+                                      Path("import-ready.json"), Path("copy-complete.json"))):
+        corrupt = temp / f"partial-diagnostic-corrupt-{index}"
+        jobs.copy_job(root, corrupt)
+        # Deliberately corrupt only disposable copied metadata, never the source evidence.
+        with (corrupt / relative).open("wb") as stream:
+            stream.write(partial)
+        destination = temp / f"refused-corrupt-copy-{index}"
+        rejected(lambda: jobs.copy_job(corrupt, destination))
+        assert not destination.exists()
+    linked = copied / diagnostic.parent / "linked.json"
+    os.link(copied / diagnostic, linked)
+    rejected(lambda: jobs.copy_job(copied, temp / "refused-linked-diagnostic"), contains="Hard-linked")
+    oversized = restored / diagnostic.parent / "oversized.json"
+    with oversized.open("xb") as stream:
+        stream.truncate(jobs.MAX_METADATA_BYTES + 1)
+    rejected(lambda: jobs.copy_job(restored, temp / "refused-oversized-diagnostic"), contains="Oversized")
+    assert jobs.load_job(root) == failed and (root / diagnostic).read_bytes() == partial
+    print("PASS partial runtime/staging copy and restore; corrupt metadata, links and size refused", flush=True)
+
+
 def main():
     started = time.monotonic()
     assert shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg/ffprobe required"
@@ -500,6 +583,7 @@ def main():
         source, silence = temp / "tone.wav", temp / "silence.wav"
         sf.write(source, audio, jobs.RATE, subtype="FLOAT")
         sf.write(silence, np.zeros_like(audio), jobs.RATE, subtype="FLOAT")
+        partial_diagnostic_copy_checks(temp, source)
         import_budget_checks(temp, source)
         a, b = temp / "a", temp / "b"
         cli("job", "create", source, a, "--intent", "music")
