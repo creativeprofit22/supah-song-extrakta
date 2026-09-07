@@ -2,6 +2,28 @@
 
 Local, modular tools to download one YouTube video, decode its audio, separate its music from dialogue/effects, and create a listening master. No cloud audio upload, paid service, or account cookies.
 
+## Reusable local jobs
+
+For new, explicitly selected recordings, use the CPU-default `songtool job` workflow:
+
+```powershell
+.venv/Scripts/python.exe -B -m songtool job create SOURCE FRESH_JOB_DIRECTORY --intent music
+.venv/Scripts/python.exe -B -m songtool job status FRESH_JOB_DIRECTORY --json
+```
+
+The destination's parent must already exist. Read status before choosing an operation;
+new renders are candidates, not listening approvals. One authorized whole-song attempt
+is the default interaction; numbered review clips are optional. GPU use requires explicit
+`job run ... --operation bandit --device cuda` (legacy `separate` still defaults to CUDA).
+See [the audio-job guide](docs/audio-workflow.md) for commands/options, exact timeline
+protection, resource limits, retry rules, verified copy/restore, and **explicit API-only
+legacy adoption with validated failed-evidence mapping and exact retry blocking**. No old audio is adopted or
+processed automatically. Local copies on the same disk are not disaster backups.
+
+The historical sections below remain evidence about distinct artifacts, not a canonical
+job lookup. The current trimmed raw track is a working baseline, not the older preferred
+master; accepted clips and the approved opening trim do not approve the whole song.
+
 ## Latest listening copy — offset excerpt approved
 
 **Start here:** `E:\Projects\stranger\outputs\final\clarity-offset\song-offset.mp3`
@@ -311,7 +333,11 @@ The one-shot local harness is `.cache/firered-aed/verify_cleanup_workflow.py` (i
 | `songtool/mastering.py` | Two-pass mastering, encoding and measurements |
 | `songtool/comparison.py` | Aligned fixed-gain comparisons and approved offset joins |
 | `songtool/cleanup.py` | Fixed-recipe, fail-closed full-song preview and bounded diagnostics |
-| `songtool/__main__.py` | Thin command-line routing; heavy ML imports only for separation |
+| `songtool/jobs.py` | Immutable local job state, provenance, feedback, selection and verified copies |
+| `songtool/review.py` | CPU hints, exact mapped clips and role-labelled comparisons |
+| `songtool/runtime.py` | Owned workers, budgets and same-workspace GPU lease |
+| `songtool/workflow.py` | Static one-attempt operations, fingerprints and technical receipts |
+| `songtool/__main__.py` | Legacy stages and explicit `job` command routing |
 
 To change separation models, replace the separation adapter and its resource definition; downloading and mastering remain independent. There is intentionally no web UI, database, custom neural network, or training system.
 

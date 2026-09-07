@@ -3,6 +3,10 @@
 import argparse
 from pathlib import Path
 import subprocess
+import json
+import os
+import sys
+from dataclasses import asdict
 
 from . import mastering, media, resources
 
@@ -47,9 +51,12 @@ def main() -> None:
     finish.add_argument("--approved", action="store_true", required=True, help="Confirm listening preference for offset_music")
     cleanup = commands.add_parser("cleanup-preview", help="One guarded full-song candidate; no promotion or playback")
     cleanup.add_argument("output", type=Path, help="Fresh directory for the recorded baseline's fixed cleanup recipe")
+    _job_parser(commands)
     args = parser.parse_args()
     try:
-        if args.command == "setup-model":
+        if args.command == "job":
+            _job_command(args)
+        elif args.command == "setup-model":
             resources.setup()
         elif args.command == "download":
             media.download(args.url, args.output)
@@ -80,6 +87,164 @@ def main() -> None:
             finish_offset(args.comparison, args.output)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"Error: {error}\n")
+
+
+def _job_parser(commands):
+    group = commands.add_parser("job", help="Explicit isolated audio jobs")
+    actions = group.add_subparsers(dest="job_command", required=True)
+    create = actions.add_parser("create")
+    create.add_argument("source", type=Path)
+    create.add_argument("directory", type=Path)
+    create.add_argument("--intent", choices=("music", "spoken_audio", "unknown"), required=True)
+    create.add_argument("--wanted-vocals-may-include-rap", action="store_true")
+    for name in ("status", "scan", "feedback", "run", "choose", "open", "recover", "copy"):
+        command = actions.add_parser(name)
+        command.add_argument("directory", type=Path)
+        if name == "status":
+            command.add_argument("--json", action="store_true")
+        if name in ("scan", "run", "choose", "open"):
+            command.add_argument("--version", required=True)
+        if name in ("scan", "run"):
+            command.add_argument("--timeout", type=int)
+            command.add_argument("--retry-reason")
+            command.add_argument("--speech-version-id")
+        if name == "scan":
+            command.add_argument("--clips", action="store_true")
+        if name == "run":
+            command.add_argument("--operation", required=True,
+                                 choices=("trim", "scan", "bandit", "gentle-denoise", "local-eq"))
+            command.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+            command.add_argument("--start-frame", type=int)
+            command.add_argument("--end-frame", type=int)
+            command.add_argument("--eq-interval", nargs=2, type=int, action="append", metavar=("START", "END"))
+            command.add_argument("--parent-sha256")
+            command.add_argument("--full-song-offset", action="store_true")
+        if name in ("choose", "feedback"):
+            command.add_argument("--note", required=True)
+            choices = ("better", "worse", "unconfirmed") if name == "choose" else (
+                "good", "residual_dialogue", "wanted_vocal_loss", "muffling", "warbling_reverse_like_artifact", "noise", "uncertain")
+            command.add_argument("--verdict", choices=choices, required=True)
+        if name == "feedback":
+            command.add_argument("--clip", required=True)
+            command.add_argument("--accepted", action="store_true")
+        if name == "recover":
+            command.add_argument("--run", required=True)
+        if name == "copy":
+            command.add_argument("destination", type=Path)
+
+
+def _status(directory):
+    from . import jobs, workflow
+    job = jobs.load_job(directory)
+    result = workflow.summarize_job(directory)
+    result["listening_scope"] = "whole_version" if result["listening"] != "unreviewed" else "none"
+    result["versions"] = [asdict(v) for v in job.versions]
+    result["runs"] = [asdict(r) for r in job.runs]
+    result["current_technical"] = next(v.technical for v in job.versions if v.id == job.current_version)
+    latest = next((r for r in job.runs if r.id == job.latest_attempt), None)
+    result["outcome"] = None
+    if latest and latest.receipt_sha256:
+        receipt, sha = jobs._read(Path(directory) / "runs" / latest.id / "receipt.json", jobs.MAX_RECEIPT_BYTES)
+        jobs.require(sha == latest.receipt_sha256, "Run receipt mismatch.")
+        result["outcome"] = receipt.get("outcome")
+    return result
+
+
+def _feedback_clip(args):
+    from . import jobs, review
+    job = jobs.load_job(args.directory)
+    jobs._id(args.clip)
+    found = None
+    root = jobs._plain(args.directory / "runs", directory=True)
+    count = 0
+    for entry in root.iterdir():
+        count += 1
+        jobs.require(count <= 1024, "Too many review directories.")
+        jobs._plain(entry, directory=True)
+        for path in (entry / "scan.json", entry / "worker" / "scan.json"):
+            if not path.exists():
+                continue
+            report, _ = jobs._read(path, jobs.MAX_RECEIPT_BYTES)
+            jobs.require(report.get("job_id") == job.id and report.get("operation") == "scan"
+                         and report.get("schema_version") == 1, "Foreign scan.")
+            _, timeline_sha = jobs._read(path.parent / "timeline.json", jobs.MAX_METADATA_BYTES)
+            jobs.require(timeline_sha == report.get("timeline_sha256"), "Scan timeline mismatch.")
+            version = next((v for v in job.versions if v.id == report["version"]["id"]), None)
+            jobs.require(version is not None and version.sha256 == report["version"]["sha256"], "Stale scan.")
+            clips = report.get("clips")
+            jobs.require(type(clips) is list and len(clips) <= 8, "Invalid clips.")
+            for clip in clips:
+                if clip.get("id") != args.clip:
+                    continue
+                first, last = clip["start_frame"], clip["end_frame_exclusive"]
+                jobs._integer(first, 0, version.frames - 1, "clip start")
+                jobs._integer(last, first + 1, version.frames, "clip end")
+                expected = review._clip(version, first, last)
+                jobs.require(all(clip.get(k) == v for k, v in expected.items()), "Invalid stable clip map.")
+                jobs.require(found is None or found == expected, "Ambiguous clip ID across versions.")
+                found = expected
+    jobs.require(found is not None, "Unknown stable clip ID.")
+    return jobs.record_feedback(args.directory, version_id=found["version_id"], category=args.verdict,
+        note=args.note, scope="interval", start_frame=found["start_frame"],
+        end_frame=found["end_frame_exclusive"], accepted=args.accepted,
+        expected_revision=job.revision, expected_revision_sha256=job.revision_sha256)
+
+
+def _job_command(args):
+    from . import jobs, workflow, review
+    action = args.job_command
+    if action == "create":
+        job = jobs.create_job(args.source, args.directory, intent=args.intent,
+                             wanted_vocals_may_include_rap=args.wanted_vocals_may_include_rap)
+        result = {"job_id": job.id, "current_version": job.current_version,
+                  "outcome": "rendered_new", "operation": "canonical_conversion", "listening": "unreviewed"}
+    elif action == "status":
+        result = _status(args.directory)
+        if not args.json:
+            for key, value in result.items():
+                print(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+            return
+    elif action in ("run", "scan"):
+        operation = "scan" if action == "scan" else args.operation
+        parameters = {}
+        for flag, key in (("start_frame", "start_frame"), ("end_frame", "end_frame"),
+                          ("eq_interval", "intervals"), ("parent_sha256", "parent_sha256"),
+                          ("speech_version_id", "speech_version_id")):
+            value = getattr(args, flag, None)
+            if value is not None:
+                parameters[key] = value
+        if getattr(args, "full_song_offset", False):
+            parameters["full_song_offset"] = True
+        result = workflow.run_operation(args.directory, operation, args.version, parameters=parameters,
+            device=getattr(args, "device", "cpu"), timeout=args.timeout, retry_reason=args.retry_reason)
+        if action == "scan" and args.clips and result["execution"] == "completed":
+            result["clips_report"] = str(review.export_review_clips(args.directory, result["run"]["id"]))
+    elif action == "open":
+        version, path = jobs.resolve_version(args.directory, args.version)
+        job = jobs.load_job(args.directory)
+        run = next((r for r in job.runs if r.id == version.run_id), None)
+        result = {"outcome": "opened_existing", "version": version.id, "path": str(path),
+                  "execution": run.execution if run else "completed", "technical": version.technical,
+                  "listening": version.listening, "listening_scope": "whole_version" if version.listening != "unreviewed" else "none",
+                  "rendered_now": False}
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        if os.name == "nt":
+            os.startfile(str(path))
+        else:
+            subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", str(path)], check=True, shell=False)
+        return
+    else:
+        if action == "feedback":
+            job = _feedback_clip(args)
+        elif action == "choose":
+            job = jobs.select_version(args.directory, args.version, verdict=args.verdict, note=args.note)
+        elif action == "recover":
+            job = jobs.recover_run(args.directory, args.run)
+        else:
+            job = jobs.copy_job(args.directory, args.destination)
+        result = {"job_id": job.id, "revision": job.revision, "current_version": job.current_version,
+                  "action": action, "rendered_now": False}
+    print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
 
 
 if __name__ == "__main__":
