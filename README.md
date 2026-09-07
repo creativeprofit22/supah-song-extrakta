@@ -221,6 +221,16 @@ It accepts only an output folder, not a different source or user-configured filt
 | `technical/` | Two continuous float64 intermediates and small delay fixtures; not alternate candidates |
 | `incomplete.json`, `failed.json` | Initial marker and failure marker; precedence rules below |
 
+`verification.audio_metadata` records measured `frames`, `samplerate`, `channels`, `format`
+and `subtype` for baseline, candidate, and both intermediates (`dry`, `wet`).
+`verification.candidate_expected` records the validated baseline frame count (14,223,987 in
+this CLI; shorter in synthetic fixtures), 48 kHz, two channels, WAV/WAVEX and PCM_24.
+Named `audio_metadata` and `finite_samples` checks are marked passed only after their guards
+complete; the latter covers every decoded frame of all four files in bounded blocks.
+Metadata/sample errors still raise without returning successful verification. Missing evidence
+is not a pass. Completed verification, including these fields, survives later diagnostic failures.
+Historical reports are unchanged and may lack these fields.
+
 Completion is fail-closed:
 
 - Any `failed.json` takes precedence over all reports, even if truncated or a final JSON says success.

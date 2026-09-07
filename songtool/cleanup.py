@@ -331,9 +331,15 @@ def correlations(baseline: Path, candidate: Path) -> list[dict]:
 
 def verify_candidate(baseline: Path, candidate: Path, dry: Path, wet: Path,
                      ffmpeg: str, windows: tuple = WINDOWS) -> dict:
-    frames = audio_info(baseline).frames
-    for path in (candidate, dry, wet):
-        audio_info(path, frames, "PCM_24" if path == candidate else None)
+    infos = {"baseline": audio_info(baseline)}
+    frames = infos["baseline"].frames
+    for name, path in (("candidate", candidate), ("dry", dry), ("wet", wet)):
+        infos[name] = audio_info(path, frames, "PCM_24" if name == "candidate" else None)
+    audio_metadata = {name: {field: getattr(info, field) for field in
+                            ("frames", "samplerate", "channels", "format", "subtype")}
+                      for name, info in infos.items()}
+    candidate_expected = {"frames": frames, "samplerate": RATE, "channels": 2,
+                          "format": ["WAV", "WAVEX"], "subtype": "PCM_24"}
     before, after = analyze_windows(baseline), analyze_windows(candidate)
     failures, warnings, checks = [], [], []
 
@@ -342,6 +348,7 @@ def verify_candidate(baseline: Path, candidate: Path, dry: Path, wet: Path,
         if not passed:
             failures.append(name)
 
+    check("audio_metadata", True, {"sources": list(infos), "candidate_expected": candidate_expected})
     original_rms, candidate_rms = overall(before), overall(after)
     delta = db(candidate_rms / original_rms) if original_rms and candidate_rms else None
     check("overall_rms", abs(delta) <= 0.5 if delta is not None else original_rms == candidate_rms == 0, delta)
@@ -378,6 +385,7 @@ def verify_candidate(baseline: Path, candidate: Path, dry: Path, wet: Path,
             dry_energy += float(np.sum(d * d))
             wet_energy += float(np.sum(w * w))
             position += len(a)
+    check("finite_samples", True, {"sources": list(infos), "frames_per_source": position})
     check("eq_untouched_regions", untouched, "Compared with identical PCM24 encoder.")
     check("eq_exact_blend", exact_recipe, "Fixed +1.5dB peaking EQ; shared raised-cosine mask.")
     eq_gain = db(math.sqrt(wet_energy / dry_energy)) if dry_energy else None
@@ -397,6 +405,7 @@ def verify_candidate(baseline: Path, candidate: Path, dry: Path, wet: Path,
             check(f"alignment_{row['start_frame']}", row["lag"] == 0 and row["correlation"] >= 0.99, row)
     return {"checks": checks, "failures": failures, "warnings": warnings, "loudness": measured,
             "overall_rms_change_db": delta, "alignment": alignment, "block_changes": block_changes,
+            "audio_metadata": audio_metadata, "candidate_expected": candidate_expected,
             "measurements": {"baseline": before, "candidate": after}}
 
 
