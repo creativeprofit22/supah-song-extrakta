@@ -184,6 +184,31 @@ Outside the approved interval the WAVs are checked sample-for-sample; the
 100 ms crossfades, final peaks and MP3 decode integrity were checked too.
 Numeric checks do not establish that the final joins are inaudible.
 
+## Full-song offset separation candidate
+
+The preferred one-second-offset separation now covers the entire source in
+`outputs/full-song-offset/music.wav` (raw float WAV, no mastering or extra cleanup).
+This is separate from the rejected light-denoise trial below. The existing preferred
+master remains unchanged; full-song listening approval is still pending.
+
+```powershell
+# Already completed here; use a fresh destination for any explicitly approved rerun.
+.venv/Scripts/python.exe -B -m songtool separate outputs/audio/trailer.wav outputs/full-song-offset --full-song-offset
+```
+
+This mode reuses the excerpt's pinned model, float32 inference, eight-second windows,
+two-second hop and one-second grid offset; it does not average two estimates.
+It cannot be combined with excerpt options. Inputs remain capped at ten minutes.
+The source hash is checked before/after inference, saved stems are reread and compared
+exactly, and `separation.json` records provenance and output hashes after export.
+Absent completion JSON means unverified/partial outputs, not a finished run.
+
+The completed run preserves all 14,223,987 stereo/48 kHz frames. Independent verification
+confirmed finite samples and stem hashes, and the raw music at 193–218 seconds is
+**sample-identical to the preferred offset experiment**. That is not a claim of
+noise-free audio or full-song listening approval. Speech and effects stems are
+references, not listening candidates. No existing master was replaced.
+
 ## Guarded full-song cleanup preview (not a replacement master)
 
 The preferred baseline remains `outputs/final/clarity-offset/song-offset.wav`.

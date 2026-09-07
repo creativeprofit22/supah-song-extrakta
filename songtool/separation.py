@@ -10,7 +10,8 @@ import time
 from .resources import CODE, REVISION, WEIGHTS, WEIGHTS_SHA256, validate_resources
 
 
-def separate(source: Path, directory: Path, device: str = "cuda") -> None:
+def separate(source: Path, directory: Path, device: str = "cuda", *, full_song_offset: bool = False) -> None:
+    import numpy as np
     import soundfile as sf
 
     source = source.resolve(strict=True)
@@ -20,12 +21,36 @@ def separate(source: Path, directory: Path, device: str = "cuda") -> None:
     info = sf.info(source)
     if info.samplerate != 48000 or info.channels != 2 or not 0 < info.duration <= 600:
         raise ValueError("Extract a stereo 48 kHz WAV first, at most ten minutes long.")
+    with source.open("rb") as stream:
+        source_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     model = _load_model(device)
     audio, rate = sf.read(source, dtype="float32", always_2d=True)
-    result = _infer_grid(audio, model, device)
+    if audio.shape != (info.frames, 2) or rate != 48000:
+        raise ValueError("Source changed or decoded with unexpected dimensions.")
+    offset = 48000 if full_song_offset else 0
+    result = _infer_grid(audio, model, device, offset)
+    with source.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != source_hash:
+            raise ValueError("Source changed during separation; no stems exported.")
     directory.mkdir(parents=True, exist_ok=False)
+    hashes = {}
     for name, stem in zip(("speech", "music", "sfx"), result):
-        sf.write(directory / f"{name}.wav", stem.T, rate, subtype="FLOAT")
+        output = directory / f"{name}.wav"
+        with output.open("xb") as stream:
+            sf.write(stream, stem.T, rate, format="WAV", subtype="FLOAT")
+        saved, saved_rate = sf.read(output, dtype="float32", always_2d=True)
+        if saved_rate != rate or saved.shape != audio.shape or not np.array_equal(saved, stem.T):
+            raise ValueError("Saved stem failed exact frame/sample verification.")
+        with output.open("rb") as stream:
+            hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+    with (directory / "separation.json").open("x", encoding="utf-8") as stream:
+        json.dump({"source": str(source), "source_sha256": source_hash,
+                   "frames": info.frames, "sample_rate": rate, "channels": 2,
+                   "offset_frames": offset, "window_frames": 384000, "hop_frames": 96000,
+                   "source_revision": REVISION, "checkpoint_sha256": WEIGHTS_SHA256,
+                   "device": device, "precision": "float32", "stem_sha256": hashes,
+                   "status": "verified_stems", "listening_approved": False}, stream, indent=2)
+        stream.write("\n")
     print(f"Stems saved: {directory}", flush=True)
 
 

@@ -23,7 +23,10 @@ def main() -> None:
     separate.add_argument("source", type=Path)
     separate.add_argument("output", type=Path, help="New directory for stems")
     separate.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    separate.add_argument("--window-offset", action="store_true", help="Opt-in two-grid excerpt experiment")
+    offset_mode = separate.add_mutually_exclusive_group()
+    offset_mode.add_argument("--window-offset", action="store_true", help="Opt-in two-grid excerpt experiment")
+    offset_mode.add_argument("--full-song-offset", action="store_true",
+                             help="Apply the preferred one-second offset grid across the full source")
     separate.add_argument("--start", type=float, help="Required with --window-offset, source seconds")
     separate.add_argument("--end", type=float, help="Required with --window-offset, source seconds")
     master = commands.add_parser("master", help="Create a 24-bit WAV, 320 kbps MP3, and measurements")
@@ -62,7 +65,7 @@ def main() -> None:
                 if args.start is not None or args.end is not None:
                     raise ValueError("--start/--end require --window-offset; default separation is unchanged.")
                 from .separation import separate as separate_audio
-                separate_audio(args.source, args.output, args.device)
+                separate_audio(args.source, args.output, args.device, full_song_offset=args.full_song_offset)
         elif args.command == "master":
             mastering.master(args.source, args.output)
         elif args.command == "compare":
