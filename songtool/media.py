@@ -51,11 +51,21 @@ def extract(source: Path, destination: Path, start: float = 0, end: float | None
     source = source.resolve(strict=True)
     if destination.suffix.lower() != ".wav":
         raise ValueError("Extraction output must use .wav.")
-    total = duration(source)
+    run(extraction_command(source, destination, start, end, duration(source)))
+
+
+def extraction_command(source: Path, destination: Path, start: float, end: float | None,
+                       total: float, *, threads: int | None = None) -> list[str]:
+    """Shared extraction argv; job imports supply already-probed duration and CPU limits."""
+    source = source.resolve(strict=True)
+    if destination.suffix.lower() != ".wav":
+        raise ValueError("Extraction output must use .wav.")
     end = total if end is None else end
     if not all(math.isfinite(v) for v in (start, end)) or not 0 <= start < end <= total:
         raise ValueError(f"Select a range inside the input (0 to {total:.3f} seconds).")
     destination = new_output(destination)
-    run(["ffmpeg", "-hide_banner", "-nostdin", "-n", "-i", str(source),
-         "-ss", str(start), "-t", str(end - start), "-map", "0:a:0", "-vn",
-         "-ac", "2", "-ar", "48000", "-c:a", "pcm_f32le", str(destination)])
+    limits = [] if threads is None else ["-threads", str(threads)]
+    filters = [] if threads is None else ["-filter_threads", str(threads), "-filter_complex_threads", str(threads)]
+    return ["ffmpeg", "-hide_banner", "-nostdin", "-n", *filters, *limits, "-i", str(source),
+            "-ss", str(start), "-t", str(end - start), "-map", "0:a:0", "-vn",
+            "-ac", "2", "-ar", "48000", "-c:a", "pcm_f32le", *limits, str(destination)]

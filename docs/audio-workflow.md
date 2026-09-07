@@ -127,6 +127,14 @@ accepts `jobs.ResourcePolicy`; there are no CLI thread/budget flags. Sources/med
 are bounded to 1 GiB each and ten minutes; canonical processing is stereo 48 kHz.
 Import checks space for the original plus maximum canonical audio/metadata; owned
 workers reserve output budget plus bounded logs (default 1 MiB, excess discarded).
+Import validates policy and capacity before launching work. One CPU-owned worker
+covers probing, copying, conversion and verification under a single remaining
+wall-time budget; numerical thread limits apply before worker imports. Import
+metadata capture and diagnostic logs are each bounded to 1 MiB. The job root's
+`runtime.json` records execution accounting; only controller-observed success can
+publish the initial state. `incomplete.json`, `import-ready.json` and partial media
+alone never constitute a healthy job. Output usage is sampled, not a filesystem
+quota; final publication also checks space used including the runtime receipt.
 These are bounded application budgets, not hard OS RAM/thermal quotas.
 
 Workers receive thread limits before numerical imports, with owned process identity,

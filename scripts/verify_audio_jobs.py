@@ -267,6 +267,80 @@ time.sleep(60)
             assert creation and not runtime.process_matches(pid, creation), (mode, pid)
 
 
+def import_budget_checks(temp, source):
+    original = source.read_bytes()
+    environment = os.environ.copy()
+    for name, policy in (("invalid-threads", replace(jobs.ResourcePolicy(), cpu_threads=0)),
+                         ("invalid-time", replace(jobs.ResourcePolicy(), wall_time_seconds=0)),
+                         ("tiny-output", replace(jobs.ResourcePolicy(), max_output_bytes=1))):
+        root = temp / name
+        with patch.object(runtime, "run_owned", side_effect=AssertionError("Invalid import launched")):
+            rejected(lambda: jobs.create_job(source, root, policy=policy))
+        assert not root.exists()
+
+    owned = runtime.run_owned
+    # Inject at real import probe/conversion boundaries inside the owned worker.
+    # Both the hanging child and grandchild record creation identities before waiting.
+    hanging = '''import json,os,subprocess,sys,time
+from pathlib import Path
+from songtool.runtime import process_identity
+p = subprocess.Popen([sys.executable, '-B', '-c', 'import time; time.sleep(60)'])
+Path(sys.argv[1]).write_text(json.dumps({
+    'identities': [[os.getpid(), process_identity(os.getpid())], [p.pid, process_identity(p.pid)]],
+    'threads': [os.environ[k] for k in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS')],
+    'cuda': os.environ.get('CUDA_VISIBLE_DEVICES')}))
+sys.stdout.buffer.write(b'x' * (2 * 1024**2)); sys.stdout.flush()
+time.sleep(60)
+'''
+    for boundary in ("probe", "conversion"):
+        root = temp / f"import-hang-{boundary}"
+        identities = root / "test-identities.json"
+        prefix = f'''import subprocess,sys,time
+from songtool import jobs
+real_capture = jobs._import_capture
+def hang(*args, **kwargs):
+    subprocess.Popen([sys.executable, '-B', '-c', {hanging!r}, {str(identities)!r}]).wait()
+'''
+        if boundary == "probe":
+            prefix += "jobs._import_capture = hang\n"
+        else:
+            # Earlier successful probes consume this same deadline, not fresh budgets.
+            prefix += "def delayed(argv):\n    time.sleep(.3)\n    return real_capture(argv)\njobs._import_capture = delayed\njobs.subprocess.run = hang\n"
+        def inject(argv, *args, **kwargs):
+            command = list(argv)
+            command[3] = prefix + command[3]
+            return owned(command, *args, **kwargs)
+        started = time.monotonic()
+        with patch.object(runtime, "run_owned", side_effect=inject):
+            rejected(lambda: jobs.create_job(source, root,
+                     policy=replace(jobs.ResourcePolicy(), cpu_threads=3, wall_time_seconds=3)), contains="timed_out")
+        assert time.monotonic() - started < 5, "Import did not honor its shared deadline"
+        result = read(root / "runtime.json")
+        assert result["status"] == "timed_out" and result["requested_device"] == "cpu"
+        assert result["log_bytes"] <= 1024**2 and result["log_discarded_bytes"] > 0
+        assert not runtime.process_matches(result["process_id"], result["process_identity"])
+        recorded = read(identities)
+        assert recorded["threads"] == ["3"] * 3 and recorded["cuda"] == ""
+        for pid, identity in recorded["identities"]:
+            assert identity and not runtime.process_matches(pid, identity)
+        assert (root / "incomplete.json").exists()
+        assert not (root / "state" / "00000001.json").exists()
+        rejected(lambda: jobs.load_job(root))
+    root = temp / "import-failed-after-ready"
+    def fail_after_ready(argv, *args, **kwargs):
+        command = list(argv)
+        command[3] += "\nraise RuntimeError('controlled failure after verification')\n"
+        return owned(command, *args, **kwargs)
+    with patch.object(runtime, "run_owned", side_effect=fail_after_ready):
+        rejected(lambda: jobs.create_job(source, root), contains="Import failed")
+    assert (root / "import-ready.json").exists()
+    assert read(root / "runtime.json")["status"] == "failed"
+    assert not (root / "state" / "00000001.json").exists()
+    rejected(lambda: jobs.load_job(root))
+    assert source.read_bytes() == original and os.environ == environment
+    print("PASS import preflight, shared deadlines, bounded logs and owned descendant teardown", flush=True)
+
+
 def legacy_evidence_checks(temp, source, unrelated):
     root = temp / "legacy-job"
     job = jobs.create_job(source, root, intent="music")
@@ -426,6 +500,7 @@ def main():
         source, silence = temp / "tone.wav", temp / "silence.wav"
         sf.write(source, audio, jobs.RATE, subtype="FLOAT")
         sf.write(silence, np.zeros_like(audio), jobs.RATE, subtype="FLOAT")
+        import_budget_checks(temp, source)
         a, b = temp / "a", temp / "b"
         cli("job", "create", source, a, "--intent", "music")
         cli("job", "create", silence, b, "--intent", "unknown")
@@ -433,6 +508,12 @@ def main():
         assert ja.id != jb.id and ja.source.sha256 != jb.source.sha256
         for root, job, src in ((a, ja, source), (b, jb, silence)):
             assert job.source.sha256 == jobs.digest(src)
+            assert (root / job.source.path).read_bytes() == src.read_bytes()
+            info = sf.info(root / job.versions[0].path)
+            assert (info.samplerate, info.channels, info.subtype) == (48000, 2, "FLOAT")
+            imported = read(root / "runtime.json")
+            assert imported["status"] == "completed" and imported["requested_device"] == "cpu"
+            assert not runtime.process_matches(imported["process_id"], imported["process_identity"])
             assert job.versions[0].frames == frames and job.versions[0].source_start_frame == 0
             assert not job.feedback and not job.protected_ranges and not job.runs
             assert job.versions[0].listening == "unreviewed"

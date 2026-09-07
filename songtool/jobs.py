@@ -23,11 +23,14 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
+import sys
+import time
 from typing import Literal
 from uuid import uuid4
 
-from .cleanup import audio_info, digest, execute, require
-from .media import extract
+from .cleanup import audio_info, digest, require
+from .media import extraction_command
 
 SCHEMA_VERSION = 1
 RATE = 48000
@@ -252,6 +255,15 @@ def _decode(value: dict, sha256: str) -> Job:
     return job
 
 
+def _validate_policy(policy: ResourcePolicy) -> None:
+    require(type(policy) is ResourcePolicy, "Invalid resource policy.")
+    _integer(policy.cpu_threads, 1, 64, "CPU threads")
+    _integer(policy.max_active_operations, 1, 1, "active operations")
+    require(policy.automatic_gpu is False, "Automatic GPU use is not supported.")
+    _integer(policy.wall_time_seconds, 1, 86400, "wall time")
+    _integer(policy.max_output_bytes, 1, 64 * 1024 ** 3, "output budget")
+
+
 def validate_job(job: Job) -> None:
     """Validate typed boundaries, references, limits and unambiguous frame maps."""
     require(type(job) is Job and type(job.source) is Source and type(job.policy) is ResourcePolicy, "Invalid job records.")
@@ -263,12 +275,7 @@ def validate_job(job: Job) -> None:
             _hash(value)
     require(job.intent in ("music", "spoken_audio", "unknown"), "Invalid intent.")
     require(type(job.wanted_vocals_may_include_rap) is bool, "Invalid vocal intent.")
-    policy = job.policy
-    _integer(policy.cpu_threads, 1, 64, "CPU threads")
-    _integer(policy.max_active_operations, 1, 1, "active operations")
-    require(policy.automatic_gpu is False, "Automatic GPU use is not supported.")
-    _integer(policy.wall_time_seconds, 1, 86400, "wall time")
-    _integer(policy.max_output_bytes, 1, 64 * 1024 ** 3, "output budget")
+    _validate_policy(job.policy)
     source = job.source
     require(type(source.path) is str and re.fullmatch(r"source/original\.[a-z0-9]{1,10}", source.path) is not None,
             "Invalid source path.")
@@ -696,11 +703,17 @@ def _version_receipt(root: Path, job_id: str, source_sha256: str, version: Versi
 def create_job(source: Path, directory: Path, *, intent: Intent = "unknown",
                wanted_vocals_may_include_rap: bool = False,
                policy: ResourcePolicy = ResourcePolicy()) -> Job:
-    """Exclusively import original bytes and convert using media.extract; no listening approval.
+    """Own the entire import under one CPU budget; share legacy extraction argv.
+
+    Only this controller publishes initial state, after terminal runtime success.
 
     Failed imports keep diagnostics but have no committed state and cannot load.
     Existing parent directory is required. No GPU, models or dependency installation.
     """
+    from . import runtime
+
+    started = time.monotonic()
+    _validate_policy(policy)
     require(intent in ("music", "spoken_audio", "unknown") and type(wanted_vocals_may_include_rap) is bool,
             "Invalid recording intent.")
     source = _plain(Path(source))
@@ -710,9 +723,63 @@ def create_job(source: Path, directory: Path, *, intent: Intent = "unknown",
     root = Path(os.path.abspath(directory))
     _plain(root.parent, directory=True)
     require(not root.exists() and not root.is_symlink(), "Job destination must be fresh.")
+    required = source.stat().st_size + MAX_FRAMES * 8 + 4 * MAX_METADATA_BYTES
+    require(shutil.disk_usage(root.parent).free >= policy.max_output_bytes + MAX_METADATA_BYTES
+            and policy.max_output_bytes >= required, "Insufficient import space/budget.")
+    deadline = started + policy.wall_time_seconds
+    remaining = deadline - time.monotonic()
+    require(remaining > 0, "Import timed_out before launch.")
+    arguments = json.dumps({"intent": intent, "wanted_vocals_may_include_rap": wanted_vocals_may_include_rap,
+                            "policy": asdict(policy)})
+    bootstrap = """import json,sys
+from pathlib import Path
+from songtool.jobs import ResourcePolicy, _import_job
+options = json.loads(sys.argv[3])
+options['policy'] = ResourcePolicy(**options['policy'])
+_import_job(Path(sys.argv[1]), Path(sys.argv[2]), **options)
+"""
+    def mark_started(pid, identity):
+        _publish(root / "incomplete.json", _encode(
+            {"schema_version": 1, "operation": "import", "process_id": pid, "process_identity": identity},
+            MAX_RECEIPT_BYTES))
+
+    result = runtime.run_owned([sys.executable, "-B", "-c", bootstrap, str(source), str(root), arguments],
+                               root, workspace=root.parent, policy=replace(policy, wall_time_seconds=remaining),
+                               device="cpu", on_started=mark_started)
+    require(result.status == "completed", f"Import {result.status}; diagnostics: {root}")
+    value, sha = _read(root / "import-ready.json", MAX_METADATA_BYTES)
+    initial = _decode(value, sha)
+    data = _encode(value, MAX_METADATA_BYTES)
+    require(runtime._bytes(root) + len(data) <= policy.max_output_bytes, "Import output_limit before publication.")
+    require(time.monotonic() < deadline, "Import timed_out before publication.")
+    _publish(root / "state" / "00000001.json", data)
+    return initial
+
+
+def _import_capture(argv: list[str]) -> str:
+    """Bounded metadata capture inside the owned import tree; supervisor owns the deadline."""
+    with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT) as child:
+        try:
+            data = child.stdout.read(MAX_METADATA_BYTES + 1)
+            require(len(data) <= MAX_METADATA_BYTES, "Import diagnostics exceeded 1 MiB.")
+            require(child.wait() == 0, f"Import command failed: {data[-4000:].decode('utf-8', errors='replace')}")
+            return data.decode("utf-8")
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+
+
+def _import_job(source: Path, root: Path, *, intent: Intent,
+                wanted_vocals_may_include_rap: bool, policy: ResourcePolicy) -> None:
+    """Owned worker only: copy/convert/verify, but never publish healthy state."""
+    _validate_policy(policy)
+    suffix = source.suffix.lower()
     source_hash = digest(source)
-    probe = json.loads(execute(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
-                               "stream=codec_name,sample_rate,channels:format=duration,format_name", "-of", "json", str(source)], 30))
+    probe = json.loads(_import_capture(["ffprobe", "-v", "error", "-threads", str(policy.cpu_threads),
+                               "-select_streams", "a:0", "-show_entries",
+                               "stream=codec_name,sample_rate,channels:format=duration,format_name", "-of", "json", str(source)]))
     require(type(probe.get("streams")) is list and len(probe["streams"]) == 1, "No supported audio stream.")
     stream, format_info = probe["streams"][0], probe["format"]
     require(digest(source) == source_hash, "Source changed during probe.")
@@ -723,23 +790,22 @@ def create_job(source: Path, directory: Path, *, intent: Intent = "unknown",
     # Validate all supplied policy/source fields before copying or decoding.
     placeholder = Version(version_id, f"versions/{version_id}/audio.wav", "0" * 64, 1, "FLOAT", "canonical",
                           technical="passed", receipt_sha256="0" * 64)
-    tools = {name: execute([name, "-version"], 10).splitlines()[0] for name in ("ffmpeg", "ffprobe")}
+    tools = {name: _import_capture([name, "-version"]).splitlines()[0] for name in ("ffmpeg", "ffprobe")}
     initial = Job(identifier, original, intent, wanted_vocals_may_include_rap, policy,
                   versions=(placeholder,), current_version=version_id)
     validate_job(initial)
     required = original.bytes + MAX_FRAMES * 8 + MAX_METADATA_BYTES
     require(shutil.disk_usage(root.parent).free >= required and policy.max_output_bytes >= required, "Insufficient import space/budget.")
-    root.mkdir(exist_ok=False)
     for name in ("state", "source", "versions", "runs"):
         (root / name).mkdir()
     _test_publication(root / "state")
-    _publish(root / "incomplete.json", _encode({"schema_version": 1, "operation": "import", "job_id": identifier}, MAX_RECEIPT_BYTES))
     original_path = root / original.path
     _copy(source, original_path)
     require(digest(original_path) == original.sha256 and digest(source) == original.sha256, "Source changed after probe.")
     output = root / placeholder.path
     output.parent.mkdir()
-    extract(original_path, output)
+    subprocess.run(extraction_command(original_path, output, 0, None, original.duration_seconds,
+                                      threads=policy.cpu_threads), stdin=subprocess.DEVNULL, check=True)
     _plain(output)
     info = audio_info(output, subtype="FLOAT")
     _finite_audio(output)
@@ -747,15 +813,14 @@ def create_job(source: Path, directory: Path, *, intent: Intent = "unknown",
         os.fsync(file.fileno())
     version = replace(placeholder, sha256=digest(output), frames=info.frames)
     version = _version_receipt(root, identifier, original.sha256, version,
-                               {"operation": "canonical_conversion", "implementation": "songtool.media.extract",
+                               {"operation": "canonical_conversion", "implementation": "songtool.media.extraction_command",
                                 "sample_rate": RATE, "channels": 2, "encoding": "pcm_f32le", "tools": tools,
                                 "lossless_conversion_claimed": False, "listening_approved": False})
     initial = replace(initial, versions=(version,), revision=1)
     validate_job(initial)
     _verify_media(root, initial)
     data = _encode(_data(initial), MAX_METADATA_BYTES)
-    _publish(root / "state" / "00000001.json", data)
-    return replace(initial, revision_sha256=hashlib.sha256(data).hexdigest())
+    _publish(root / "import-ready.json", data)
 
 
 def register_version(directory: Path, audio: Path, *, parent_id: str, parent_start_frame: int,
