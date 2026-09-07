@@ -125,9 +125,12 @@ def preflight(root: Path = ROOT) -> dict:
     finish, receipt = read_json(finish_path), read_json(receipt_path)
     require(finish.get("start_frame") == FIRST and finish.get("end_frame_exclusive") == LAST
             and finish.get("onset_trim_seconds") == 0, "Finish interval changed.")
+    source = receipt.get("source")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("Invalid listening receipt source field: expected a nonempty string.")
     require(receipt.get("source_start_frame") == FIRST and receipt.get("source_end_frame_exclusive") == LAST
             and receipt.get("original_offset_seconds") == 193 and receipt.get("original_end_seconds") == 218
-            and Path(receipt.get("source", "")).resolve() == inputs["baseline"], "Listening receipt changed.")
+            and Path(source).resolve() == inputs["baseline"], "Listening receipt changed.")
     for name in ("cleanup-preview-notes.md", "brightness-preview-notes.md", "targeted-diagnosis.md"):
         inputs[name] = (root / PREVIEWS / name).resolve(strict=True)
     inputs.update(finish_receipt=finish_path.resolve(), listening_receipt=receipt_path.resolve())
