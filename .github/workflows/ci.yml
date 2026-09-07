@@ -28,6 +28,11 @@ jobs:
           python-version: "3.12"
       - name: Install locked dependencies
         run: uv sync --locked
-      # No portable test or lint script exists; the local audio harness requires ignored fixtures.
+      - name: Install CI audio tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+      - name: Verify portable audio jobs (synthetic audio, no models)
+        run: uv run --no-sync python -B scripts/verify_audio_jobs.py
       - name: Build source distribution and wheel
         run: uv build

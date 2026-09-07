@@ -82,8 +82,12 @@ GitHub CI uses Python 3.12 on Ubuntu, `uv sync --locked`, then `uv build` throug
 setuptools backend in `pyproject.toml`. Direct dependencies come from `requirements.txt`;
 `uv.lock` records the portable resolution. Run `uv lock` after changing those requirements.
 The build produces a wheel and source archive locally; CI does not upload artifacts.
-No portable test or lint script is configured, so CI is **build-only**, not audio validation.
-The ignored local cleanup harness requires the original project's private audio/receipts and FFmpeg.
+The portable synthetic harness is `python -B scripts/verify_audio_jobs.py`; it needs the
+installed dependencies and FFmpeg/ffprobe, but no models, GPU or private trailer fixtures.
+CI verification wiring is defined in `.github/workflows/ci.yml`; the verification
+contract is this harness before the build. No lint command is configured. Neither a green build nor
+synthetic checks establish audio quality or listening approval. The ignored local cleanup
+harness still requires the original project's private audio/receipts and FFmpeg.
 Checkout v7.0.1 and setup-uv v10.0.1 were verified against their official READMEs/releases
 on 2026-09-07 and pinned by commit in `.github/workflows/ci.yml`.
 
