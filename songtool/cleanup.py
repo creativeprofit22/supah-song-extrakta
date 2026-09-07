@@ -488,17 +488,33 @@ def save_report(directory: Path, report: dict) -> None:
     lines = ["# Full-song cleanup trial", "", f"Status: **{report['status']}**; listening approval: **not granted**.",
              "Preferred master remains outputs/final/clarity-offset/song-offset.wav.",
              f"Runtime: {report['elapsed_seconds']:.3f} seconds.", "",
-             "One continuous denoise pass, measured 1,200-frame compensation; fixed localized +1.5dB EQ only.",
-             "All original frames, including the opening, retained. Onset remains unconfirmed.",
-             "The brief sound at original 197–198s was not specifically targeted or removed.",
+             "Intended settings: one continuous denoise pass, 1,200-frame compensation; fixed localized +1.5dB EQ only.",
+             "Intended frame coverage: all original frames, including the opening. Onset remains unconfirmed.",
+             "The intended recipe does not specifically target the brief sound at original 197–198s.",
              "No FireRed gate, separation, GPU scan, normalization, automatic promotion or iterative repair.",
              "Technical thresholds are conservative experiment limits, not perceptual guarantees.",
              "The excerpt preference does not establish full-song improvement; residual speech and dullness remain subjective.",
              "Full-song context can differ from the isolated listened excerpt near its edges.", "",
              "## Outcome", str(report.get("error", "All automatic guards passed.")),
-             f"Overall RMS change: {report.get('verification', {}).get('overall_rms_change_db')} dB.",
-             "Detailed checks, hashes, versions, timings, warnings and excerpt comparisons are in report.json.",
              "This Markdown is provisional until final report.json exists; any failed.json overrides success."]
+    delay = report.get("delay_fixture", {}).get("delay_samples")
+    lines.append(f"Delay fixture: configured {delay:,}-frame compensation verified."
+                 if delay is not None else "Delay fixture: not verified.")
+    lines.append("Rendering: completed." if "render" in report.get("timings", {})
+                 else "Rendering: not completed.")
+    verification = report.get("verification")
+    lines.append("Frame preservation: matching output frame counts verified; onset remains unconfirmed."
+                 if verification is not None else "Frame preservation: not verified.")
+    delta = verification.get("overall_rms_change_db") if verification is not None else None
+    lines.append(f"Overall RMS change: {delta} dB." if delta is not None
+                 else "Overall RMS change: not measured (silence or unavailable diagnostics).")
+    if verification is not None:
+        lines.append("Detailed checks and warnings are in report.json.")
+    if "excerpt_comparison" in report:
+        lines.append("Excerpt comparisons are in report.json.")
+    else:
+        lines.append("Excerpt comparisons: not completed.")
+    lines.append("Available provenance, hashes, versions and timings are in report.json.")
     if report["status"] == "verified_candidate":
         lines.extend(["", "## Optional listening", "candidate.wav is the single unapproved full-song candidate.",
                       "review-reel.wav: A baseline then B candidate, unity gain, 0.5s separators, identical 10ms edge fades.",
