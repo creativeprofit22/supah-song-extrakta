@@ -545,15 +545,24 @@ def preview(destination: Path) -> Path:
             checkpoint = time.monotonic()
             verification = verify_candidate(baseline, candidate, technical / "denoised-float.wav",
                                             technical / "eq-float.wav", ffmpeg)
-            measurements = verification.pop("measurements")
-            for name in ("original", "raw_music", "offset_music"):
-                measurements[name] = analyze_windows(context["inputs"][name])
-            save_metrics(directory, measurements)
-            report["context_reference_summaries"] = {
-                name: {"rms_dbfs": db(overall(measurements[name])), "role": "Context only, not a clean-music target"}
-                for name in ("original", "raw_music", "offset_music")}
             report["verification"] = verification
-            report["excerpt_comparison"] = excerpt_comparison(candidate, context["inputs"])
+            measurements = verification.pop("measurements")
+            report["context_reference_summaries"] = {}
+            diagnostics = report["diagnostics"] = {"status": "incomplete"}
+            try:
+                for name in ("original", "raw_music", "offset_music"):
+                    diagnostics["stage"] = "context_reference:" + name
+                    measurements[name] = analyze_windows(context["inputs"][name])
+                    report["context_reference_summaries"][name] = {
+                        "rms_dbfs": db(overall(measurements[name])), "role": "Context only, not a clean-music target"}
+                diagnostics["stage"] = "metrics_csv"
+                save_metrics(directory, measurements)
+                diagnostics["stage"] = "excerpt_comparison"
+                report["excerpt_comparison"] = excerpt_comparison(candidate, context["inputs"])
+            except BaseException as error:
+                diagnostics.update(status="failed", error=str(error) or type(error).__name__)
+                raise
+            report["diagnostics"] = {"status": "complete"}
             report["timings"]["diagnostics"] = time.monotonic() - checkpoint
             require(not verification["failures"], "Technical guards failed: " + ", ".join(verification["failures"]))
             checkpoint = time.monotonic()
