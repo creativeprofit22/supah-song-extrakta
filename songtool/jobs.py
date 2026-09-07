@@ -404,7 +404,79 @@ def _test_publication(directory: Path) -> None:
         first.unlink()
 
 
-def _verify_media(root: Path, job: Job) -> None:
+def _validate_version_verification(root: Path, job: Job, version: Version, details: dict) -> dict:
+    """Recheck actual samples; caller status and report hashes alone cannot confer a pass."""
+    from . import workflow
+
+    require(type(details) is dict, "Invalid version verification details.")
+    report = details.get("verification")
+    require(type(report) is dict and report.get("technical") == "passed"
+            and report.get("failures") == [], "Technical pass requires a passing verification report.")
+    parent = next(v for v in job.versions if v.id == version.parent_id)
+    protected = [[r.start_frame, r.end_frame] for r in mapped_protected_ranges(job, parent.id)]
+    legacy = False
+    registration = details.get("operation") == "register"
+    operation, parameters = report.get("operation"), report.get("parameters")
+    if registration:
+        require(details.get("parent_start_frame") == version.source_start_frame - parent.source_start_frame
+                and details.get("timeline") == "explicit_translation", "Registration timeline mismatch.")
+    if not registration or version.run_id is not None:
+        run = next((r for r in job.runs if r.id == version.run_id), None)
+        require(run is not None and run.execution == "completed" and run.technical == "passed"
+                and run.parent_id == parent.id and run.parent_sha256 == parent.sha256
+                and (registration or details.get("fingerprint") == run.fingerprint), "Verification run mismatch.")
+        intent, _ = _read(root / "runs" / run.id / "intent.json", MAX_RECEIPT_BYTES)
+        identity = {k: v for k, v in intent.items()
+                    if k not in ("fingerprint", "rendered_now", "listening_approved", "retry_reason", "controller")}
+        require(hashlib.sha256(_encode(identity, MAX_RECEIPT_BYTES)).hexdigest() == run.fingerprint
+                and intent.get("fingerprint") == run.fingerprint
+                and intent.get("source_sha256") == job.source.sha256
+                and intent.get("parent_id") == parent.id and intent.get("parent_sha256") == parent.sha256
+                and intent.get("source_start_frame") == parent.source_start_frame
+                and intent.get("protected_intervals") == protected
+                and intent.get("operation") == run.operation, "Verification intent mismatch.")
+        if registration:
+            require(operation == run.operation and parameters == intent.get("parameters"),
+                    "Registration operation/parameters do not match the linked run.")
+            receipt, sha = _read(root / "runs" / run.id / "receipt.json", MAX_RECEIPT_BYTES)
+            produced = receipt.get("version")
+            require(sha == run.receipt_sha256
+                    and receipt.get("run") == asdict(replace(run, receipt_sha256=None))
+                    and receipt.get("job_id") == job.id and receipt.get("source_sha256") == job.source.sha256
+                    and receipt.get("fingerprint") == run.fingerprint
+                    and receipt.get("execution") == "completed" and receipt.get("technical") == "passed"
+                    and type(produced) is dict
+                    and all(produced.get(key) == getattr(version, key) for key in
+                            ("sha256", "frames", "subtype", "parent_id", "parent_sha256", "source_start_frame", "run_id")),
+                    "Registration candidate does not match the linked run receipt.")
+        else:
+            operation, parameters = intent["operation"], intent.get("parameters")
+            # Old worker reports predate the embedded context. Their immutable intent
+            # supplies it, but the numerical checks still run; history is never rewritten.
+            legacy = "operation" not in report
+    require(type(operation) is str and operation in workflow.OPERATIONS and operation != "scan"
+            and type(parameters) is dict, "Verification needs an explicit rendering operation/parameters.")
+    parameters = workflow._parameters(operation, parameters, parent)
+    start = parameters["start_frame"] if operation == "trim" else 0
+    end = parameters["end_frame"] if operation == "trim" else parent.frames
+    require(version.source_start_frame == parent.source_start_frame + start and version.frames == end - start
+            and version.subtype == "DOUBLE", "Verification timeline/encoding mismatch.")
+    require(report.get("candidate_sha256") == version.sha256 and report.get("frames") == version.frames
+            and report.get("encoding") == version.subtype, "Verification candidate mismatch.")
+    fresh = workflow.validate_result(root / parent.path, root / version.path, operation=operation,
+                                     parameters=parameters, protected_intervals=protected)
+    require(fresh["technical"] == "passed", "Independent verification failed: " + ", ".join(fresh["failures"]))
+    expected = dict(fresh)
+    if legacy:
+        for key in ("parent_sha256", "parent_frames", "parent_start_frame", "operation", "parameters", "protected_intervals"):
+            del expected[key]
+    require(_encode(report, MAX_RECEIPT_BYTES) == _encode(expected, MAX_RECEIPT_BYTES),
+            "Verification report does not match independently validated audio/context.")
+    return fresh
+
+
+def _verify_media(root: Path, job: Job, *, creation_jobs: dict[str, Job] | None = None,
+                  verified_versions: tuple[Version, ...] = ()) -> None:
     source = _plain(_internal(root, job.source.path))
     require(source.stat().st_size == job.source.bytes and digest(source) == job.source.sha256, "Source hash/size mismatch.")
     for version in job.versions:
@@ -419,6 +491,10 @@ def _verify_media(root: Path, job: Job) -> None:
         require(sha == version.receipt_sha256 and receipt.get("version") == expected
                 and receipt.get("job_id") == job.id and receipt.get("source_sha256") == job.source.sha256,
                 "Version receipt mismatch.")
+        if version.parent_id is not None and version.technical == "passed" and not any(
+                replace(v, listening=version.listening) == version for v in verified_versions):
+            context = creation_jobs[version.id] if creation_jobs is not None else job
+            _validate_version_verification(root, context, version, receipt.get("details"))
     for run in job.runs:
         if run.receipt_sha256 is None:
             continue
@@ -458,6 +534,7 @@ def load_job(directory: Path) -> Job:
             require(len(names) <= MAX_REVISIONS, "Revision history limit reached.")
     require(bool(names), "Incomplete job: no committed revision.")
     previous = None
+    creation_jobs = {}
     for index, name in enumerate(sorted(names), 1):
         require(name == f"{index:08d}.json", "Missing revision; refusing older state.")
         value, sha = _read(state / name, MAX_METADATA_BYTES)
@@ -468,8 +545,10 @@ def load_job(directory: Path) -> Job:
             _transition(previous, job)
         else:
             require(job.current_version == job.versions[0].id, "Initial current version must be canonical.")
+        for version in job.versions[len(previous.versions) if previous else 0:]:
+            creation_jobs[version.id] = job
         previous = job
-    _verify_media(root, job)
+    _verify_media(root, job, creation_jobs=creation_jobs)
     return job
 
 
@@ -506,7 +585,7 @@ def commit_revision(directory: Path, job: Job) -> Job:
     candidate = replace(job, revision=before.revision + 1, previous_revision_sha256=before.revision_sha256,
                         revision_sha256=None)
     validate_job(candidate)
-    _verify_media(root, candidate)
+    _verify_media(root, candidate, verified_versions=before.versions)
     data = _encode(_data(candidate), MAX_METADATA_BYTES)
     try:
         _publish(root / "state" / f"{candidate.revision:08d}.json", data)
@@ -687,8 +766,9 @@ def register_version(directory: Path, audio: Path, *, parent_id: str, parent_sta
 
     Caller explicitly attests a length-preserving or simple-trim timeline via
     parent_start_frame (relative to parent). No cross-file alignment is inferred.
-    A passed candidate requires a bounded verification receipt supplied by the
-    future workflow validator; this API does not perform perceptual verification.
+    A passed candidate requires a workflow.validate_result report for the exact
+    parent, operation/parameters and mapped protection. Application code reruns
+    those numerical checks before publication; this is not perceptual verification.
     On conflict, orphan media/receipt remain diagnostic, not registered success.
     """
     job = load_job(directory)
@@ -724,6 +804,8 @@ def register_version(directory: Path, audio: Path, *, parent_id: str, parent_sta
     path.parent.mkdir(exist_ok=False)
     _copy(audio, path)
     require(digest(path) == version.sha256, "Candidate changed during registration.")
+    if technical == "passed":
+        details["verification"] = _validate_version_verification(root, job, version, details)
     version = _version_receipt(root, job.id, job.source.sha256, version, details)
     candidate = replace(job, versions=(*job.versions, version),
                         latest_technically_passed_candidate=version.id if technical == "passed"
@@ -890,6 +972,7 @@ def copy_job(directory: Path, destination: Path) -> Job:
     for name in ("runs", "state", "source", "versions"):
         (target / name).mkdir(exist_ok=True)
     require(load_job(root).revision_sha256 == job.revision_sha256, "Job changed during copy.")
-    _verify_media(target, job)
+    # All copied bytes match the loaded source, including creation-time history.
+    _verify_media(target, job, verified_versions=job.versions)
     _publish(target / "copy-complete.json", _encode(marker, MAX_RECEIPT_BYTES))
     return load_job(target)

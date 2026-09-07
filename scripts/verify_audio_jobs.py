@@ -338,6 +338,82 @@ def legacy_evidence_checks(temp, source, unrelated):
     print("PASS explicit legacy evidence adoption, exact blocking, copy and mapping rejection", flush=True)
 
 
+def verification_receipt_checks(temp, source):
+    root = temp / "verification-history"
+    cli("job", "create", source, root, "--intent", "music")
+    initial = jobs.load_job(root)
+    parent = initial.versions[0]
+    parameters = {"start_frame": 123, "end_frame": 60000}
+    publish = jobs._version_receipt
+    context_keys = ("parent_sha256", "parent_frames", "parent_start_frame", "operation",
+                    "parameters", "protected_intervals")
+
+    def old_worker_receipt(root, job_id, source_sha256, version, details):
+        old_report = {k: v for k, v in details["verification"].items() if k not in context_keys}
+        return publish(root, job_id, source_sha256, version, {**details, "verification": old_report})
+
+    # Produce a real worker result in the prior receipt format, without editing history.
+    with patch.object(jobs, "_version_receipt", side_effect=old_worker_receipt):
+        result = workflow.run_operation(root, "trim", parameters=parameters)
+    assert result["execution"] == "completed", result
+    receipt_path = (root / result["version"]["path"]).parent / "receipt.json"
+    old_bytes = receipt_path.read_bytes()
+    wet = temp / "verification-wet.wav"
+    samples = sf.read(root / parent.path, dtype="float64", always_2d=True)[0]
+    sf.write(wet, samples * .999, jobs.RATE, subtype="DOUBLE")
+    report = workflow.validate_result(root / parent.path, wet, operation="bandit")
+    before_link = snapshot(root)
+    rejected(lambda: register(root, wet, technical="passed", verification=report,
+                              run_id=result["run"]["id"]), contains="run")
+    assert snapshot(root) == before_link
+    linked_audio = root / result["version"]["path"]
+    linked_report = workflow.validate_result(root / parent.path, linked_audio, operation="trim", parameters=parameters)
+    current = jobs.load_job(root)
+    linked = jobs.register_version(root, linked_audio, parent_id=parent.id, parent_start_frame=123,
+        technical="passed", verification=linked_report, run_id=result["run"]["id"],
+        expected_revision=current.revision, expected_revision_sha256=current.revision_sha256)
+    assert jobs.load_job(root).versions[-1].run_id == result["run"]["id"]
+    assert linked.current_version == initial.current_version
+    # Persist an invalid association as old unchecked registration could do.
+    copied_link = temp / "invalid-run-link"
+    jobs.copy_job(root, copied_link)
+    with patch.object(jobs, "_validate_version_verification", return_value=report):
+        invalid_link = register(copied_link, wet, technical="passed", verification=report, run_id=result["run"]["id"])
+    rejected(lambda: jobs.load_job(copied_link), contains="linked run")
+    rejected(lambda: jobs.select_version(copied_link, invalid_link.versions[-1].id,
+                                         verdict="better", note="must refuse"), contains="linked run")
+    with patch.object(runtime, "run_owned", side_effect=OSError("Synthetic operational failure")):
+        failed_run = workflow.run_operation(root, "trim", parameters={"start_frame": 124, "end_frame": 60000})
+    assert failed_run["execution"] == "failed"
+    before_failed_link = snapshot(root)
+    rejected(lambda: register(root, wet, technical="passed", verification=report,
+                              run_id=failed_run["run"]["id"]), contains="run mismatch")
+    assert snapshot(root) == before_failed_link
+    registered = register(root, wet, technical="passed", verification=report)
+    # Feedback added later must not retroactively alter an immutable technical check.
+    jobs.record_feedback(root, version_id=parent.id, category="good", note="Later synthetic acceptance",
+                         scope="whole", accepted=True, expected_revision=registered.revision,
+                         expected_revision_sha256=registered.revision_sha256)
+    loaded = jobs.load_job(root)
+    assert loaded.versions[-1].technical == "passed" and receipt_path.read_bytes() == old_bytes
+    history = snapshot(root)
+    for index, altered in enumerate(({"technical": "failed", "failures": ["protected_samples"]},
+                                     {"candidate_sha256": "0" * 64}, {})):
+        copied = temp / f"invalid-verification-{index}"
+        jobs.copy_job(root, copied)
+        # Model old unchecked registration by bypassing only the new gate while
+        # writing a fresh synthetic receipt/state. Then restore the real loader.
+        with patch.object(jobs, "_validate_version_verification", return_value={**report, **altered}):
+            invalid = register(copied, wet, technical="passed", verification={**report, **altered})
+        assert invalid.current_version == initial.current_version
+        rejected(lambda: jobs.load_job(copied))
+        rejected(lambda: jobs.select_version(copied, invalid.versions[-1].id,
+                                             verdict="better", note="must refuse"))
+        assert read(sorted((copied / "state").glob("*.json"))[-1])["current_version"] == initial.current_version
+    assert snapshot(root) == history
+    print("PASS receipt-load rejection, immutable old worker receipts and creation-time protection", flush=True)
+
+
 def main():
     started = time.monotonic()
     assert shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg/ffprobe required"
@@ -365,6 +441,7 @@ def main():
         cli("job", "create", source, a, "--intent", "music", ok=False)
         integrity_checks(b, temp)
         legacy_evidence_checks(temp, source, b)
+        verification_receipt_checks(temp, source)
         budget_job = jobs.load_job(a)
         jobs.commit_revision(a, replace(budget_job,
                              policy=replace(budget_job.policy, max_output_bytes=16 * 1024**2)))
@@ -426,7 +503,8 @@ def main():
         preserved_path = temp / "preserved.wav"
         review._write_audio(preserved_path, preserved)
         verified = workflow.validate_result(a / ja.versions[0].path, preserved_path,
-            operation="local-eq", protected_intervals=[interval])
+            operation="local-eq", parameters={"parent_sha256": ja.versions[0].sha256,
+                                               "intervals": [[0, frames]]}, protected_intervals=[interval])
         assert verified["technical"] == "passed", verified
         rejected(lambda: workflow._preserve(parent, parent * .999, [(1, 100)]), contains="transition")
         before = snapshot(a)
@@ -441,6 +519,36 @@ def main():
         sf.write(violation, changed_audio, jobs.RATE, subtype="DOUBLE")
         check = workflow.validate_result(a / ja.versions[0].path, violation, operation="bandit", protected_intervals=[(900,1100)])
         assert check["technical"] == "failed" and "protected_samples" in check["failures"]
+        before_registration = snapshot(a)
+        current_id = jobs.load_job(a).current_version
+        rejected(lambda: register(a, violation, technical="passed", verification=check), contains="passing verification")
+        # A genuine pass computed without this job's protection must not confer a pass.
+        unprotected = workflow.validate_result(a / ja.versions[0].path, violation, operation="bandit")
+        assert unprotected["technical"] == "passed"
+        rejected(lambda: register(a, violation, technical="passed", verification=unprotected), contains="protected_samples")
+        protected_report = workflow.validate_result(a / ja.versions[0].path, a / eq["version"]["path"],
+            operation="bandit", protected_intervals=[[r.start_frame, r.end_frame]
+                for r in jobs.mapped_protected_ranges(jobs.load_job(a), ja.versions[0].id)])
+        for altered in ({"candidate_sha256": "0" * 64}, {"parent_sha256": "0" * 64},
+                        {"failures": ["true_peak"]}, {"parent_start_frame": 1},
+                        {"protected_intervals": []}, {"frames": frames - 1}, {"encoding": "FLOAT"}):
+            rejected(lambda: register(a, a / eq["version"]["path"], technical="passed",
+                                      verification={**protected_report, **altered}))
+        assert snapshot(a) == before_registration
+        assert jobs.load_job(a).current_version == current_id
+        # Failed registrations leave only diagnostics, never selectable versions.
+        registered_ids = {v.id for v in jobs.load_job(a).versions}
+        for orphan in (a / "versions").iterdir():
+            if orphan.name not in registered_ids:
+                rejected(lambda: jobs.select_version(a, orphan.name, verdict="better", note="must refuse"),
+                         contains="Unknown selection")
+        validated = register(a, a / eq["version"]["path"], technical="passed",
+                             verification=protected_report).versions[-1]
+        assert jobs.load_job(a).current_version == current_id
+        selected = jobs.select_version(a, validated.id, verdict="better", note="Synthetic validated registration")
+        assert selected.current_version == validated.id
+        jobs.select_version(a, current_id, verdict="better", note="Restore synthetic test preference")
+        print("PASS registration revalidates status, hashes, timeline, encoding and protected samples", flush=True)
         failed = register(a, violation, technical="failed", verification=check).versions[-1]
         cli("job", "choose", a, "--version", failed.id, "--verdict", "better", "--note", "must refuse", ok=False)
         unverified = register(a, source).versions[-1]

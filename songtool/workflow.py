@@ -12,6 +12,7 @@ import shutil
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 from . import cleanup as c, jobs, runtime
 
@@ -260,9 +261,11 @@ def validate_result(parent: Path, candidate: Path, *, operation: str,
     import numpy as np
     import soundfile as sf
     c.require(operation in OPERATIONS and operation != "scan", "Not a rendering operation.")
-    p = parameters or {}
-    start = p["start_frame"] if operation == "trim" else 0
     parent_frames = c.audio_info(parent).frames
+    parent_sha256 = c.digest(parent)
+    p = _parameters(operation, parameters, SimpleNamespace(frames=parent_frames, sha256=parent_sha256))
+    protected_intervals = [list(pair) for pair in protected_intervals]
+    start = p["start_frame"] if operation == "trim" else 0
     end = p["end_frame"] if operation == "trim" else parent_frames
     jobs._integer(start, 0, parent_frames - 1, "result parent start")
     jobs._integer(end, start + 1, parent_frames, "result parent end")
@@ -319,7 +322,9 @@ def validate_result(parent: Path, candidate: Path, *, operation: str,
     return {"technical": "failed" if failures else "passed", "failures": failures,
             "encoding": "DOUBLE", "decoded_protection_exact": "protected_samples" not in failures,
             "candidate_sha256": c.digest(candidate), "frames": len(b), "loudness": loud,
-            "listening_approved": False}
+            "parent_sha256": parent_sha256, "parent_frames": parent_frames,
+            "parent_start_frame": start, "operation": operation, "parameters": p,
+            "protected_intervals": protected_intervals, "listening_approved": False}
 
 
 def _worker(directory, run_id):

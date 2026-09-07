@@ -184,7 +184,15 @@ media, names, receipts and the older preferred master untouched.
    as a distinct `role="legacy_preferred_master"`, using their real parents/offsets.
    Keep historical receipt hashes, paths, mapping rationale and bounded evidence in
    `verification`; this is evidence metadata, not automatic guard verification. Leave
-   `technical="not_run"` unless explicit applicable technical evidence justifies a pass.
+   `technical="not_run"` for historical evidence alone. A new `technical="passed"`
+   registration requires a `workflow.validate_result` report using the exact registered
+   parent, candidate, supported operation/parameters and `jobs.mapped_protected_ranges`
+   intervals. Registration independently reruns the fixed numerical checks; stale,
+   contradictory or mismatched reports are rejected. An optional `run_id` must identify
+   a passed, completed run whose immutable intent and receipt match that exact result.
+   Loading rechecks passed receipts
+   against their creation-time protection, not feedback added later. Older legitimate
+   worker receipts use their immutable run intent and are not rewritten.
    A failed diagnostic WAV may be registered `technical="failed"`; this is **not** a
    failed workflow Run and does not block fingerprint retries.
 4. Preserve scan manifests as hash-verified exclusive copies in a separately managed
