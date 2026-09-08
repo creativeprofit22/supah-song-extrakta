@@ -507,6 +507,7 @@ def _verify_media(root: Path, job: Job, *, creation_jobs: dict[str, Job] | None 
             continue
         receipt, sha = _read(root / "runs" / run.id / "receipt.json", MAX_RECEIPT_BYTES)
         require(sha == run.receipt_sha256, "Run receipt hash mismatch.")
+        _validate_render_activity(root, job, run, receipt)
         if "legacy_evidence" in receipt:
             evidence = receipt["legacy_evidence"]
             require(receipt.get("run") == asdict(replace(run, receipt_sha256=None))
@@ -580,6 +581,39 @@ def _transition(before: Job, after: Job) -> None:
         require(old.execution == "running" or old == new, "Terminal run is immutable.")
 
 
+def _check_run_headroom(job: Job) -> None:
+    """Reserve future commits and worst-case snapshot growth, without changing schema.
+
+    Recompute on every active snapshot so feedback/policy/API writers cannot spend
+    the reservation. Loading old history deliberately does not require headroom.
+    """
+    active = next((r for r in job.runs if r.execution == "running"), None)
+    if active is None:
+        return
+    remaining = 2 if active.process_id is None else 1  # child identity, then terminal/recovery
+    require(job.revision + remaining <= MAX_REVISIONS,
+            "Insufficient run revision headroom; history cannot be pruned.")
+    # _text allows 256 UTF-8 bytes; JSON control-character escaping costs six
+    # bytes each. Include the largest PID, status, hash and revision encodings.
+    terminal = replace(active, execution="interrupted", technical="not_run",
+                       process_id=2 ** 32 - 1, process_identity="\u0001" * 256,
+                       receipt_sha256="f" * 64)
+    projected = replace(job, revision=MAX_REVISIONS, previous_revision_sha256="f" * 64,
+                        runs=tuple(terminal if r.id == active.id else r for r in job.runs))
+    if active.operation != "scan":
+        require(len(job.versions) < MAX_RECORDS, "Insufficient run version headroom.")
+        # All supported renderers publish one DOUBLE candidate with this shape.
+        # Frame/offset maxima deliberately overestimate even a full-length trim.
+        identifier = "f" * 32
+        candidate = Version(identifier, f"versions/{identifier}/audio.wav", "f" * 64,
+                            MAX_FRAMES, "DOUBLE", "candidate", active.parent_id,
+                            active.parent_sha256, MAX_FRAMES, active.id, "passed",
+                            receipt_sha256="f" * 64)
+        projected = replace(projected, versions=(*job.versions, candidate),
+                            latest_technically_passed_candidate=identifier)
+    _encode(_data(projected), MAX_METADATA_BYTES)
+
+
 def commit_revision(directory: Path, job: Job) -> Job:
     """Commit a replacement of a loaded snapshot; stale revision/digest raises RevisionConflict."""
     validate_job(job)
@@ -592,6 +626,7 @@ def commit_revision(directory: Path, job: Job) -> Job:
     candidate = replace(job, revision=before.revision + 1, previous_revision_sha256=before.revision_sha256,
                         revision_sha256=None)
     validate_job(candidate)
+    _check_run_headroom(candidate)
     _verify_media(root, candidate, verified_versions=before.versions)
     data = _encode(_data(candidate), MAX_METADATA_BYTES)
     try:
@@ -898,6 +933,49 @@ def select_version(directory: Path, version_id: str, *, verdict: str, note: str)
         current_version=version.id if verdict == "better" else job.current_version))
 
 
+def _render_acknowledgement(root: Path, job: Job, run: Run) -> dict | None:
+    """A completed, decoded export is evidence of activity, never guard approval."""
+    worker = root / "runs" / run.id / "worker"
+    path = worker / "render-complete.json"
+    if not path.exists():
+        return None
+    ack, _ = _read(path, 4096)
+    parent = next(v for v in job.versions if v.id == run.parent_id)
+    intent, _ = _read(worker.parent / "intent.json", MAX_RECEIPT_BYTES)
+    require(run.operation != "scan" and intent.get("fingerprint") == run.fingerprint,
+            "Invalid render acknowledgement intent.")
+    frames = parent.frames
+    if run.operation == "trim":
+        parameters = intent["parameters"]
+        _integer(parameters["start_frame"], 0, parent.frames - 1, "render start")
+        _integer(parameters["end_frame"], parameters["start_frame"] + 1, parent.frames, "render end")
+        frames = parameters["end_frame"] - parameters["start_frame"]
+    _hash(ack.get("audio_sha256"))
+    _integer(ack.get("frames"), 1, MAX_FRAMES, "render frames")
+    require(ack == {"schema_version": 1, "job_id": job.id, "source_sha256": job.source.sha256,
+                    "run_id": run.id, "fingerprint": run.fingerprint,
+                    "parent_id": parent.id, "parent_sha256": run.parent_sha256,
+                    "audio_sha256": ack["audio_sha256"], "encoding": "DOUBLE", "frames": frames},
+            "Render acknowledgement identity/format mismatch.")
+    audio = _plain(worker / "candidate.wav")
+    audio_info(audio, frames, "DOUBLE")
+    require(digest(audio) == ack["audio_sha256"], "Render acknowledgement audio hash mismatch.")
+    return ack
+
+
+def _validate_render_activity(root: Path, job: Job, run: Run, receipt: dict) -> None:
+    # Historical receipts used promotion success, not completed diagnostic activity.
+    if "render_acknowledgement" not in receipt:
+        return
+    ack = receipt["render_acknowledgement"]
+    require(type(receipt.get("rendered_now")) is bool
+            and receipt["rendered_now"] == (ack is not None), "Inconsistent render activity.")
+    if ack is not None:
+        require(ack == _render_acknowledgement(root, job, run), "Render acknowledgement mismatch.")
+    require(run.execution != "completed" or run.operation == "scan" or ack is not None,
+            "Completed render lacks acknowledgement.")
+
+
 def recover_run(directory: Path, run_id: str) -> Job:
     """Reconcile an immutable terminal receipt or mark a dead owner interrupted.
 
@@ -924,6 +1002,16 @@ def recover_run(directory: Path, run_id: str) -> Job:
         require(not runtime.process_matches(controller["pid"], controller["identity"]), "Run controller is still active.")
     else:
         require(run.process_id is not None, "No recorded ownership identity; recovery fails closed.")
+    guardian_path = run_dir / "worker" / "guardian.json"
+    if guardian_path.exists():
+        guardian, _ = _read(guardian_path, MAX_RECEIPT_BYTES)
+        require(type(guardian) is dict and set(guardian) == {"pid", "identity"}, "Invalid guardian identity.")
+        _integer(guardian["pid"], 1, 2**32-1, "guardian PID")
+        _text(guardian["identity"], "guardian identity")
+        require(not runtime.process_matches(guardian["pid"], guardian["identity"]), "Run guardian is still active.")
+        require(not (guardian_path.parent / "guardian-started").exists()
+                or (guardian_path.parent / "guardian-stopped").is_file(),
+                "Owned tree teardown is unconfirmed; recovery fails closed.")
     if run.process_id is not None:
         require(not runtime.process_matches(run.process_id, run.process_identity), "Run child is still active.")
     # Child identity can have been published before its state callback committed.
@@ -931,13 +1019,18 @@ def recover_run(directory: Path, run_id: str) -> Job:
     if identity_path.exists():
         identity, _ = _read(identity_path, MAX_RECEIPT_BYTES)
         require(not runtime.process_matches(identity["pid"], identity["identity"]), "Uncommitted child is active.")
+        if sys.platform.startswith("linux") and identity["identity"].startswith(
+                "linux:" + Path("/proc/sys/kernel/random/boot_id").read_text().strip() + ":"):
+            require(not runtime._group_alive(identity["pid"]), "Owned descendants are still active.")
     receipt_path = run_dir / "receipt.json"
     if not receipt_path.exists():
         terminal = replace(run, execution="interrupted", technical="not_run", receipt_sha256=None)
+        acknowledgement = _render_acknowledgement(root, job, run)
         receipt = {"schema_version": 1, "job_id": job.id, "source_sha256": job.source.sha256,
                    "fingerprint": run.fingerprint, "run": asdict(terminal), "version": None,
                    "execution": "interrupted", "technical": "not_run", "listening": "unreviewed",
-                   "failure_kind": "operational", "outcome": "interrupted", "rendered_now": False}
+                   "failure_kind": "operational", "outcome": "interrupted",
+                   "render_acknowledgement": acknowledgement, "rendered_now": acknowledgement is not None}
         _publish(receipt_path, _encode(receipt, MAX_RECEIPT_BYTES))
     receipt, sha = _read(receipt_path, MAX_RECEIPT_BYTES)
     require(receipt.get("schema_version") == 1 and receipt.get("job_id") == job.id
@@ -950,6 +1043,7 @@ def recover_run(directory: Path, run_id: str) -> Job:
             "Terminal receipt does not match committed run identity.")
     require(receipt.get("execution") == terminal.execution and receipt.get("technical") == terminal.technical,
             "Inconsistent terminal receipt.")
+    _validate_render_activity(root, job, terminal, receipt)
     terminal = replace(terminal, receipt_sha256=sha)
     candidate = _record(Version, receipt["version"]) if receipt.get("version") is not None else None
     if terminal.execution == "completed":

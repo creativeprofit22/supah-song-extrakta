@@ -38,7 +38,7 @@ python -B -m songtool job status JOB --json
 python -B -m songtool job open JOB --version current
 python -B -m songtool job scan JOB --version VERSION_ID
 python -B -m songtool job scan JOB --version VERSION_ID --clips
-python -B -m songtool job feedback JOB --clip CLIP_ID --verdict good --accepted --note "Exact user wording"
+python -B -m songtool job feedback JOB --clip CLIP_ID --version VERSION_ID --verdict good --accepted --note "Exact user wording"
 python -B -m songtool job run JOB --operation gentle-denoise --version VERSION_ID --device cpu --timeout 600
 python -B -m songtool job open JOB --version CANDIDATE_ID
 python -B -m songtool job choose JOB --version CANDIDATE_ID --verdict better --note "Whole-version listening judgment"
@@ -50,6 +50,20 @@ python -B -m songtool job copy JOB FRESH_DESTINATION
 intent flag, not a license to mix speech back into music. Unknown/spoken recordings
 can be tracked and scanned; explicitly choosing Bandit is an intentional music-separation
 request, not an inferred treatment. Quality for other recording types is not promised.
+
+Canonical API summaries and CLI status (JSON or labelled text) expose the recorded
+`intent`, `wanted_vocals_may_include_rap`, and explanatory `recommendations`.
+Music guidance requires explicit operation selection, CPU by default, and explicit
+CUDA selection for Bandit. Spoken/unknown guidance warns that music-specific separation
+requires explicit selection and may remove wanted speech. When the rap flag is true,
+status cautions to preserve wanted vocals and not use speech-stem reinsertion or
+denoise as restoration of missing vocals; restoration needs new capability.
+These are advisory messages, not operation bans or treatment selections. A false rap
+flag is not evidence that speech is unwanted. Intent changes no samples, thresholds,
+repair eligibility, or listening approval; `repair_status` remains feedback-based.
+Status reads and verifies recorded history: it starts no operation worker or model.
+Historical receipt verification may invoke FFmpeg for numerical checks, without
+rendering a new candidate or changing listening approval.
 
 All scan/run/open version selectors accept `current`; prefer a resolved ID after status.
 `choose` requires an actual ID. `status` without `--json` prints labelled fields.
@@ -79,7 +93,14 @@ hints, not confirmed defects or exhaustive detection. Without an aligned speech 
 `speech_similarity_hint` is unavailable, not proof of clean audio. Tonal-dip hints are
 not user-reported muffling. Optional export provides at most eight five-second clips.
 
-Use stable clip IDs from the scan report, not displayed clip numbers. Each identifies
+Copy both `id` and `version_id` from the same clip in the scan or exported clips report,
+not displayed clip numbers. Pass them as `--clip CLIP_ID --version VERSION_ID`.
+The optional feedback `--version` requires an exact registered ID in that job, not `current`.
+Without it, feedback still works when the clip matches only one version; ambiguous
+matches fail and require `--version ID`. Identical audio on the same map can share a
+stable clip ID across versions. Feedback and acceptance apply only to the selected
+version (protection can follow its descendants), never unrelated matching versions.
+Existing clip IDs and immutable receipts do not change. Each clip identifies
 its parent hash, `[start_frame, end_frame)` and source map. Time is integer 48 kHz frames:
 source frame = version `source_start_frame` + local frame. Only length-preserving
 translations and simple trims are supported; equal duration alone proves no alignment.
@@ -103,11 +124,33 @@ consult feedback and failed receipts, then state operation, device, and limits. 
 one approved operation. Report `opened_existing`, `analyzed_only`, `rendered_new`,
 `reused_result`, or failure honestly, with execution, technical, and scoped listening
 states separate. Failed work may leave partial diagnostics; it is not a candidate
-success even if audio exists. `rendered_now=false` on reuse/open means no new render.
+success even if audio exists. New run receipts include `render_acknowledgement`: null
+until a worker has completed its exclusive, flushed, decoded-equality-checked export
+and published an immutable `worker/render-complete.json` (at most 4 KiB). The controller
+verifies its job/run/fingerprint/parent identity and diagnostic WAV hash, DOUBLE encoding,
+stereo 48 kHz format and expected frame count. File existence alone is not completion.
+`rendered_now=true` means that run completed a diagnostic render, even when numerical
+guards, concurrent feedback or candidate publication fail. Such failures retain their
+failed outcome and no published candidate version; they never change preference or
+confer listening approval. Missing/invalid acknowledgements cannot establish completion.
+Analysis-only, pre-render failure, reuse and open report `rendered_now=false`.
+Reuse retains the original acknowledgement as historical evidence, not new activity.
+Recovery preserves a terminal receipt byte-for-byte; without one, it records verified
+render activity from the interrupted run, not work performed by recovery itself.
+The recovery CLI still reports no new render. Historical receipts without the
+`render_acknowledgement` field retain the older promotion-dependent boolean semantics:
+a false value cannot rule out a completed failed diagnostic. They are never rewritten.
 
-Wanted-vocal loss and warbling/reverse-like feedback on the current ancestry produce
-`no_supported_repair`: new capability is needed. Denoising is not an appropriate
-substitute. Other hints likewise do not promise an available cure.
+Wanted-vocal loss and warbling/reverse-like feedback on the selected version or its
+ancestors produce `no_supported_repair` only when their scope overlaps surviving
+audio. Interval feedback is translated to source frames and intersected with the
+selected version's half-open source interval, including through nested trims;
+disjoint intervals and exact boundary contact do not block denoise. Whole-version
+feedback covers the ancestor's entire interval and remains applicable to descendants.
+Sibling/descendant feedback does not flow sideways or backwards, regardless of equal
+lengths. Status and denoise preflight use the same scope rule without changing original
+wording, scope, or history. Overlapping wanted-vocal loss/reverse-like artifacts still
+need new capability, not denoising. Other hints likewise do not promise an available cure.
 
 Fingerprints include source/parent hashes, mapping, operation/version/parameters,
 protected intervals, device, pinned model/checkpoint and relevant tool/code versions.
@@ -145,12 +188,32 @@ elapsed time, child identity, output accounting and inference evidence; telemetr
 `unavailable` when absent, never a guessed temperature or a thermal safety guarantee.
 No GPU power settings, precision, or overlap policy is changed.
 
+A separate guardian owns the Windows Job Object/Linux process group and GPU lease
+before the controller can release real work. A private liveness pipe triggers exact-tree
+teardown after abrupt controller death, as well as normal timeout/cancellation. Linux
+keeps the group leader unreaped until teardown and uses a subreaper for orphaned
+children. The guardian retains ownership and the lease until descendants have stopped,
+even if the kernel delays termination. No process-name killing is used.
+
+Recovery checks controller, guardian and worker PID/creation identities. A started
+guardian-owned tree also needs its stop acknowledgement before recovery can publish
+interruption. Missing acknowledgement fails closed; do not remove ownership evidence
+to free a job. Legacy Linux worker receipts also block recovery while their process
+group remains active. These guarantees cover this tool's owned, non-detaching workers,
+not independently daemonized external applications.
+
 `source/`, `versions/`, `runs/` and `state/00000001.json` onward hold immutable media,
 receipts and consecutive hash-linked snapshots. Publication is exclusive, report-last;
 missing/corrupt state fails closed, without falling back to an older revision. Limits:
 256 versions, 256 runs, 2,000 feedback records, 4,096 revisions, 1 MiB per state JSON,
 64 KiB per receipt (registration details have a smaller bound). Limits refuse further
-mutation, never silently prune. Do not edit committed files or hard-linked staging files.
+mutation, never silently prune. Before publishing a running intent, scan/render runs
+reserve revisions for intent, optional child identity and terminal/recovery state,
+plus worst-case snapshot bytes and a render candidate slot. Every commit retaining
+an active run preserves that headroom; feedback and policy changes may be refused
+before the absolute limits. Insufficient headroom refuses work before launch.
+Existing snapshots remain readable without retroactively requiring this reservation.
+Do not edit committed files or hard-linked staging files.
 
 `recover` checks the recorded process identity before marking dead work interrupted,
 or reconciles matching terminal receipts. It never reruns or deletes artifacts.

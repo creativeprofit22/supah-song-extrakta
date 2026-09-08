@@ -50,6 +50,25 @@ with patch('os.startfile' if os.name == 'nt' else 'subprocess.run'):
     runpy.run_module('songtool', run_name='__main__')
 """
         command = [sys.executable, "-B", "-c", bootstrap, *map(str, args)]
+    if args[:2] == ("job", "status"):
+        bootstrap = """import runpy,subprocess,sys
+from pathlib import Path
+from unittest.mock import patch
+popen = subprocess.Popen
+def status_process(argv, *args, **kwargs):
+    # Historical receipt verification may measure loudness; never launch an audio worker.
+    assert Path(argv[0]).name in ('ffmpeg', 'ffmpeg.exe'), argv
+    return popen(argv, *args, **kwargs)
+sys.argv = ['songtool', *sys.argv[1:]]
+with patch('subprocess.Popen', side_effect=status_process), \
+\
+     patch('songtool.runtime.run_owned', side_effect=AssertionError('Status launched a worker')), \
+     patch('songtool.resources.setup', side_effect=AssertionError('Status fetched a model')), \
+     patch('songtool.resources.validate_resources', side_effect=AssertionError('Status accessed a model')):
+    runpy.run_module('songtool', run_name='__main__')
+assert not any(n == 'torch' or n.startswith('torch.') or n == 'songtool.separation' for n in sys.modules)
+"""
+        command = [sys.executable, "-B", "-c", bootstrap, *map(str, args)]
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=30)
     assert (result.returncode == 0) == ok, (args, result.stdout, result.stderr)
     return result.stdout if raw or not ok else json.loads(result.stdout)
@@ -70,8 +89,12 @@ def register(root, audio, **kwargs):
         expected_revision_sha256=job.revision_sha256, **kwargs)
 
 
-def child_mode(mode, root):
+def child_mode(mode, root, operation="trim"):
     """Real independent writers/controllers, with deterministic boundary injection."""
+    if mode.startswith("bounded-"):
+        _, operation, mode = mode.split("-", 2)
+        with patch.object(jobs, "MAX_REVISIONS", 4), patch.object(jobs, "MAX_METADATA_BYTES", 6500):
+            return child_mode(mode, root, operation)
     if mode == "writer":
         job = jobs.load_job(root)
         (root / f"ready-{os.getpid()}").touch()
@@ -84,10 +107,27 @@ def child_mode(mode, root):
         except jobs.RevisionConflict:
             return 23
         return 0
+    if mode == "owned-interrupt":
+        from verify_owned_runtime import WORKER, hold_teardown
+        owned = runtime.run_owned
+        def hanging(argv, output, **kwargs):
+            return owned([sys.executable, "-B", "-c", WORKER, str(root / "ids.json")], output, **kwargs)
+        with hold_teardown(), patch.object(runtime, "run_owned", hanging):
+            workflow.run_operation(root, "trim", parameters={"start_frame": 321, "end_frame": 60000})
+        raise AssertionError("Controller was not terminated")
     if mode == "interrupt":
         with patch.object(runtime, "run_owned", side_effect=lambda *a, **k: os._exit(25)):
-            workflow.run_operation(root, "trim", parameters={"start_frame": 500, "end_frame": 60000})
+            workflow.run_operation(root, operation,
+                parameters={"start_frame": 500, "end_frame": 60000} if operation == "trim" else {})
         raise AssertionError("Interruption injection was not reached")
+    if mode == "render-interrupt":
+        owned = runtime.run_owned
+        def stop_after_render(*args, **kwargs):
+            owned(*args, **kwargs)
+            os._exit(26)
+        with patch.object(runtime, "run_owned", stop_after_render):
+            workflow.run_operation(root, "trim", parameters={"start_frame": 321, "end_frame": 60000})
+        raise AssertionError("Post-render interruption was not reached")
     if mode == "crash":
         original = workflow._publish
         def publish(path, value, *args, **kwargs):
@@ -101,7 +141,8 @@ def child_mode(mode, root):
                 os._exit(24)
             return sha
         with patch.object(workflow, "_publish", publish):
-            workflow.run_operation(root, "trim", parameters={"start_frame": 321, "end_frame": 60000})
+            workflow.run_operation(root, operation,
+                parameters={"start_frame": 321, "end_frame": 60000} if operation == "trim" else {})
         raise AssertionError("Crash injection was not reached")
     raise AssertionError(mode)
 
@@ -124,6 +165,59 @@ def spawn(mode, root):
 def finish(process, code):
     out, err = process.communicate(timeout=25)
     assert process.returncode == code, (process.returncode, out, err)
+
+
+def owned_recovery_checks(temp, source):
+    from verify_owned_runtime import kill_exact
+    root = temp / "owned-recovery"
+    jobs.create_job(source, root)
+    process = spawn("owned-interrupt", root)
+    controller_identity = runtime.process_identity(process.pid)
+    assert controller_identity is not None
+    identities, output = [], None
+    try:
+        wait_for(lambda: (root / "ids.json.ready").exists(), process)
+        active = jobs.load_job(root)
+        output = root / "runs" / active.latest_attempt / "worker"
+        identities = read(root / "ids.json")
+        for name in ("process.json", "guardian.json"):
+            owner = read(output / name)
+            identities.append([owner["pid"], owner["identity"]])
+        kill_exact(process.pid, controller_identity)
+        process.wait(timeout=10)
+        wait_for(lambda: (output / "teardown-waiting").exists())
+        before = snapshot(root)
+        rejected(lambda: jobs.recover_run(root, active.latest_attempt), contains="guardian")
+        assert snapshot(root) == before and jobs.load_job(root).runs[-1].execution == "running"
+        assert all(runtime.process_matches(*item) for item in identities)
+        (output / "allow-stop").touch()
+        wait_for(lambda: not any(runtime.process_matches(*item) for item in identities))
+        # Even dead identities alone are insufficient for a guardian-owned run.
+        stopped = output / "guardian-stopped"
+        stopped.rename(output / "saved-stopped")
+        try:
+            rejected(lambda: jobs.recover_run(root, active.latest_attempt), contains="unconfirmed")
+            assert snapshot(root) == before
+        finally:
+            (output / "saved-stopped").rename(stopped)
+        jobs.recover_run(root, active.latest_attempt)
+        terminal = jobs.load_job(root).runs[-1]
+        assert terminal.execution == "interrupted" and terminal.technical == "not_run"
+        print("PASS recovery retains ownership during failed teardown and requires stop evidence", flush=True)
+    finally:
+        if output is not None:
+            (output / "allow-stop").touch(exist_ok=True)
+        kill_exact(process.pid, controller_identity)
+        process.communicate(timeout=10)
+        if (root / "ids.json.ready").exists():
+            identities.extend(read(root / "ids.json"))
+        for path in (root / "runs").glob("*/worker/*json"):
+            if path.name in ("process.json", "guardian.json"):
+                owner = read(path)
+                identities.append([owner["pid"], owner["identity"]])
+        for pid, identity in reversed(identities):
+            kill_exact(pid, identity)
+        wait_for(lambda: not any(runtime.process_matches(*item) for item in identities))
 
 
 def integrity_checks(root, temp):
@@ -458,7 +552,7 @@ def verification_receipt_checks(temp, source):
                                          verdict="better", note="must refuse"), contains="linked run")
     with patch.object(runtime, "run_owned", side_effect=OSError("Synthetic operational failure")):
         failed_run = workflow.run_operation(root, "trim", parameters={"start_frame": 124, "end_frame": 60000})
-    assert failed_run["execution"] == "failed"
+    assert failed_run["execution"] == "failed" and not failed_run["rendered_now"]
     before_failed_link = snapshot(root)
     rejected(lambda: register(root, wet, technical="passed", verification=report,
                               run_id=failed_run["run"]["id"]), contains="run mismatch")
@@ -488,6 +582,135 @@ def verification_receipt_checks(temp, source):
     print("PASS receipt-load rejection, immutable old worker receipts and creation-time protection", flush=True)
 
 
+def render_activity_checks(temp, source):
+    parameters = {"start_frame": 0, "end_frame": 60000}
+    for mode in ("partial", "publication", "feedback", "invalid-ack", "unacknowledged"):
+        root = temp / f"render-activity-{mode}"
+        initial = jobs.create_job(source, root, intent="music")
+        owned = runtime.run_owned
+
+        def concurrent_feedback(*args, **kwargs):
+            accounting = owned(*args, **kwargs)
+            job = jobs.load_job(root)
+            jobs.record_feedback(root, version_id=job.current_version, category="uncertain",
+                note="Concurrent synthetic feedback", scope="whole", expected_revision=job.revision,
+                expected_revision_sha256=job.revision_sha256)
+            return accounting
+
+        def incomplete_write(path, audio):
+            with path.open("xb") as stream:
+                stream.write(b"RIFFpartial")
+            raise OSError("Injected partial audio write")
+
+        def inline_worker(argv, output, **kwargs):
+            output.mkdir(exist_ok=False)
+            workflow._worker(root, argv[-1])
+            raise OSError("Injected controller failure after worker")
+
+        def invalid_ack(path, value, *args, **kwargs):
+            if path.name == "render-complete.json":
+                if mode == "unacknowledged":
+                    raise OSError("Injected acknowledgement publication failure")
+                value = {**value, "run_id": jobs.new_id()}
+            return publish(path, value, *args, **kwargs)
+
+        publish = workflow._publish
+        if mode == "partial":
+            with patch.object(runtime, "run_owned", inline_worker), patch.object(review, "_write_audio", incomplete_write):
+                receipt = workflow.run_operation(root, "trim", parameters=parameters)
+        elif mode == "publication":
+            with patch.object(jobs, "_version_receipt", side_effect=OSError("Injected publication failure")):
+                receipt = workflow.run_operation(root, "trim", parameters=parameters)
+        elif mode == "feedback":
+            with patch.object(runtime, "run_owned", concurrent_feedback):
+                receipt = workflow.run_operation(root, "trim", parameters=parameters)
+        else:
+            with patch.object(runtime, "run_owned", inline_worker), patch.object(workflow, "_publish", invalid_ack):
+                receipt = workflow.run_operation(root, "trim", parameters=parameters)
+        completed = mode in ("publication", "feedback")
+        assert receipt["rendered_now"] is completed, receipt
+        assert (receipt["render_acknowledgement"] is not None) is completed
+        assert receipt["outcome"] == receipt["execution"] == "failed" and receipt["version"] is None
+        assert not receipt["listening_approved"]
+        after = jobs.load_job(root)
+        assert after.versions == initial.versions and after.current_version == initial.current_version
+        assert after.latest_technically_passed_candidate is None
+        worker = root / "runs" / receipt["run"]["id"] / "worker"
+        if mode == "partial":
+            assert (worker / "candidate.wav").read_bytes() == b"RIFFpartial"
+            assert not (worker / "render-complete.json").exists()
+        elif mode == "invalid-ack":
+            assert "acknowledgement invalid" in receipt["error"]
+        elif mode == "unacknowledged":
+            assert sf.info(worker / "candidate.wav").frames == parameters["end_frame"]
+            assert not (worker / "render-complete.json").exists()
+        else:
+            assert jobs.digest(worker / "candidate.wav") == receipt["render_acknowledgement"]["audio_sha256"]
+            assert receipt["verification"]["technical"] == "passed", receipt
+            if mode == "feedback":
+                assert receipt["technical"] == "failed"
+
+    loud = temp / "render-recovery-loud.wav"
+    sf.write(loud, np.ones((72000, 2)) * 1.1, jobs.RATE, subtype="DOUBLE")
+    for mode in ("crash", "render-interrupt"):
+        root = temp / f"render-recovery-{mode}"
+        initial = jobs.create_job(loud, root, intent="music")
+        controller = spawn(mode, root)
+        try:
+            if mode == "crash":
+                wait_for(lambda: (root / "receipt-ready").exists(), controller)
+                (root / "crash-now").touch()
+            finish(controller, 24 if mode == "crash" else 26)
+            running = jobs.load_job(root)
+            run_id = running.latest_attempt
+            path = root / "runs" / run_id / "receipt.json"
+            old_bytes = path.read_bytes() if path.exists() else None
+            recovered = jobs.recover_run(root, run_id)
+            receipt = read(path)
+            assert receipt["rendered_now"] and receipt["version"] is None
+            assert receipt["render_acknowledgement"]["frames"] == 60000 - 321
+            assert receipt["technical"] == ("failed" if mode == "crash" else "not_run")
+            assert recovered.runs[-1].execution == ("failed" if mode == "crash" else "interrupted")
+            assert recovered.versions == initial.versions and recovered.current_version == initial.current_version
+            assert recovered.latest_technically_passed_candidate is None
+            if old_bytes is not None:
+                assert path.read_bytes() == old_bytes
+            history = snapshot(root)
+            assert jobs.recover_run(root, run_id) == recovered and snapshot(root) == history
+            copied = temp / f"render-recovery-copy-{mode}"
+            assert jobs.copy_job(root, copied) == recovered
+            ack_path = copied / "runs" / run_id / "worker" / "render-complete.json"
+            for change in ({"frames": 123}, {"audio_sha256": "0" * 64}, {"encoding": "FLOAT"}):
+                # Corrupt disposable copied evidence, never the original receipt/history.
+                ack_path.write_text(json.dumps({**receipt["render_acknowledgement"], **change}), encoding="utf-8")
+                rejected(lambda: jobs.load_job(copied))
+            for key, value in (("rendered_now", False), ("render_acknowledgement", None)):
+                rejected(lambda: jobs._validate_render_activity(root, recovered, recovered.runs[-1],
+                                                               {**receipt, key: value}))
+        finally:
+            if controller.poll() is None:
+                controller.kill(); controller.wait()
+    legacy_root = temp / "historical-render-activity"
+    jobs.create_job(loud, legacy_root, intent="music")
+    publish = workflow._publish
+    def historical_receipt(path, value, *args, **kwargs):
+        if path.name == "receipt.json":
+            value = {k: v for k, v in value.items() if k != "render_acknowledgement"}
+            value["rendered_now"] = False
+        return publish(path, value, *args, **kwargs)
+    with patch.object(workflow, "_publish", historical_receipt):
+        result = workflow.run_operation(legacy_root, "trim", parameters=parameters)
+    receipt_path = Path("runs") / result["run"]["id"] / "receipt.json"
+    historical_bytes = (legacy_root / receipt_path).read_bytes()
+    assert not read(legacy_root / receipt_path)["rendered_now"]
+    legacy = jobs.load_job(legacy_root)
+    assert legacy.runs[-1].technical == "failed"
+    copied = temp / "historical-render-copy"
+    assert jobs.copy_job(legacy_root, copied) == legacy
+    assert (copied / receipt_path).read_bytes() == historical_bytes == (legacy_root / receipt_path).read_bytes()
+    print("PASS completed vs partial renders, publication/feedback failures and immutable crash recovery", flush=True)
+
+
 def partial_diagnostic_copy_checks(temp, source):
     root = temp / "partial-diagnostic-job"
     job = jobs.create_job(source, root, intent="music")
@@ -514,6 +737,7 @@ def partial_diagnostic_copy_checks(temp, source):
                                          device="cpu", timeout=30)
     assert receipt["execution"] == "failed" and receipt["failure_kind"] == "operational"
     assert receipt["version"] is None and receipt["runtime"] is None
+    assert receipt["rendered_now"] and receipt["render_acknowledgement"] is not None
     failed = jobs.load_job(root)
     assert failed.current_version == job.current_version and failed.versions == job.versions
     diagnostic = Path("runs") / failed.runs[-1].id / "worker" / "runtime.json"
@@ -571,6 +795,309 @@ def partial_diagnostic_copy_checks(temp, source):
     print("PASS partial runtime/staging copy and restore; corrupt metadata, links and size refused", flush=True)
 
 
+def clip_version_feedback_checks(temp, source):
+    root = temp / "clip-version-feedback"
+    job = jobs.create_job(source, root, intent="music")
+    canonical = job.versions[0]
+    versions = [register(root, root / canonical.path).versions[-1] for _ in range(2)]
+    assert versions[0].id != versions[1].id
+    assert versions[0].sha256 == versions[1].sha256 == canonical.sha256
+    assert versions[0].source_start_frame == versions[1].source_start_frame == 0
+    scans = [review.scan_version(root, v.id, speech_version_id=v.id) for v in versions]
+    clips = [read(path)["clips"][0] for path in scans]
+    assert clips[0]["id"] == clips[1]["id"]
+    assert [c["version_id"] for c in clips] == [v.id for v in versions]
+    immutable = {p: p.read_bytes() for scan in scans for p in (scan, scan.parent / "timeline.json")}
+    args = ("job", "feedback", root, "--clip", clips[0]["id"], "--verdict", "good", "--accepted")
+    before = jobs.load_job(root)
+    result = subprocess.run([sys.executable, "-B", "-m", "songtool", *map(str, args),
+                             "--note", "Ambiguous acceptance must not persist"],
+                            cwd=ROOT, capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0 and "--version" in result.stderr, result.stderr
+    assert jobs.load_job(root) == before
+    for identifier in ("invalid", jobs.new_id(), canonical.id):
+        cli(*args, "--version", identifier, "--note", "Invalid target", ok=False)
+        assert jobs.load_job(root) == before
+    for index, version in enumerate(versions):
+        note = f"Exact acceptance for sibling {index}"
+        cli(*args, "--version", version.id, "--note", note)
+        job = jobs.load_job(root)
+        item = job.feedback[-1]
+        assert len(job.feedback) == len(job.protected_ranges) == index + 1
+        assert (item.version_id, item.note, item.scope, item.accepted) == (version.id, note, "interval", True)
+        assert (item.start_frame, item.end_frame) == (clips[index]["start_frame"], clips[index]["end_frame_exclusive"])
+        for sibling_index, sibling in enumerate(versions):
+            protected = jobs.mapped_protected_ranges(job, sibling.id)
+            assert len(protected) == (1 if sibling_index <= index else 0)
+            if protected:
+                assert protected[0].feedback_id == job.feedback[sibling_index].id
+                assert (protected[0].start_frame, protected[0].end_frame) == (item.start_frame, item.end_frame)
+        assert not jobs.mapped_protected_ranges(job, canonical.id)
+        assert job.current_version == canonical.id and job.versions == before.versions
+    assert all(p.read_bytes() == data for p, data in immutable.items())
+    print("PASS colliding clips: explicit version feedback/protection, invalid targets and immutable scans", flush=True)
+
+
+def feedback_scope_checks(temp, source):
+    # Synthetic mapped trims only; denoise dispatch always fails before any worker.
+    for category in ("wanted_vocal_loss", "warbling_reverse_like_artifact"):
+        root = temp / category
+        jobs.create_job(source, root, intent="music")
+
+        def trim(parent, first, last):
+            job = jobs.load_job(root)
+            audio = sf.read(root / parent.path, start=first, stop=last, always_2d=True)[0]
+            path = temp / f"{jobs.new_id()}.wav"
+            sf.write(path, audio, jobs.RATE, subtype="FLOAT")
+            return jobs.register_version(root, path, parent_id=parent.id, parent_start_frame=first,
+                expected_revision=job.revision, expected_revision_sha256=job.revision_sha256).versions[-1]
+
+        def feedback(version, scope, first=None, last=None):
+            job = jobs.load_job(root)
+            return jobs.record_feedback(root, version_id=version.id, category=category,
+                note="Keep this exact scoped wording.", scope=scope, start_frame=first, end_frame=last,
+                expected_revision=job.revision, expected_revision_sha256=job.revision_sha256)
+
+        def check(version, blocked):
+            before = jobs.load_job(root)
+            status = workflow.summarize_job(root, version.id)
+            assert status["repair_status"] == ("no_supported_repair" if blocked else "explicit_operation_required")
+            with patch.object(runtime, "run_owned", side_effect=RuntimeError("controlled scope dispatch failure")) as worker:
+                if blocked:
+                    rejected(lambda: workflow.run_operation(root, "gentle-denoise", version.id),
+                             contains="no_supported_repair")
+                    worker.assert_not_called()
+                    assert jobs.load_job(root) == before
+                else:
+                    receipt = workflow.run_operation(root, "gentle-denoise", version.id)
+                    worker.assert_called_once()
+                    assert receipt["outcome"] == "failed" and receipt["failure_kind"] == "operational"
+                    assert "controlled scope dispatch failure" in receipt["error"]
+            after = jobs.load_job(root)
+            assert after.feedback == before.feedback and after.versions == before.versions
+
+        canonical = jobs.load_job(root).versions[0]
+        origin = trim(canonical, 200, 2000)
+        disjoint = trim(origin, 300, 800)
+        overlap = trim(origin, 150, 800)
+        boundary = trim(origin, 200, 800)
+        left_boundary = trim(origin, 0, 100)
+        nested_disjoint = trim(overlap, 50, 650)
+        nested_overlap = trim(overlap, 25, 650)
+        sibling = trim(canonical, 200, 2000)  # Equal length/map is not ancestry.
+        recorded = feedback(origin, "interval", 100, 200)
+        assert recorded.feedback[-1].start_frame == 100 and recorded.feedback[-1].end_frame == 200
+        for version, blocked in ((origin, True), (disjoint, False), (overlap, True),
+                                 (boundary, False), (left_boundary, False),
+                                 (nested_disjoint, False), (nested_overlap, True),
+                                 (sibling, False), (canonical, False)):
+            check(version, blocked)
+        feedback(origin, "whole")
+        for version in (origin, disjoint, overlap, boundary, left_boundary, nested_disjoint, nested_overlap):
+            check(version, True)
+    print("PASS scoped feedback: disjoint/overlap/boundary/nested/whole and status-run agreement", flush=True)
+
+
+def run_headroom_checks(temp, source):
+    base = temp / "headroom-base"
+    initial = jobs.create_job(source, base, policy=replace(jobs.ResourcePolicy(),
+                              max_output_bytes=256 * 1024**2, wall_time_seconds=30))
+    original_source = source.read_bytes()
+    originals = {}
+
+    def remember(root):
+        originals[root] = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    remember(base)
+
+    def fresh(name):
+        root = temp / f"headroom-{name}"
+        jobs.copy_job(base, root)
+        remember(root)
+        return root
+
+    def unchanged(root):
+        assert source.read_bytes() == original_source
+        assert all((root / p).read_bytes() == data for p, data in originals[root].items())
+
+    def run(root, operation):
+        return workflow.run_operation(root, operation, device="cpu", timeout=30,
+            parameters={"start_frame": 123, "end_frame": 60000} if operation == "trim" else {})
+
+    # Both dispatch and direct commits must refuse before publishing active state.
+    for operation in ("scan", "trim"):
+        for limit in (2, 3, "bytes"):
+            root = fresh(f"refuse-{operation}-{limit}")
+            parent = initial.versions[0]
+            active = jobs.Run(jobs.new_id(), operation, "f" * 64, parent.id, parent.sha256)
+            pending = replace(initial, runs=(active,), latest_attempt=active.id)
+            size = len(jobs._encode(jobs._data(replace(pending, revision=2,
+                                   previous_revision_sha256=initial.revision_sha256)), jobs.MAX_METADATA_BYTES))
+            with patch.object(jobs, "MAX_REVISIONS", 8 if limit == "bytes" else limit), \
+                    patch.object(jobs, "MAX_METADATA_BYTES", size + 10 if limit == "bytes" else 6500), \
+                    patch.object(runtime, "run_owned", side_effect=AssertionError("Refused run launched")) as owned:
+                before = snapshot(root)
+                rejected(lambda: run(root, operation))
+                owned.assert_not_called()
+                assert not list((root / "runs").iterdir())
+                rejected(lambda: jobs.commit_revision(root, pending))
+                assert jobs.load_job(root) == initial and snapshot(root) == before
+                assert jobs.copy_job(root, temp / f"copy-refused-{operation}-{limit}") == initial
+            unchanged(root)
+
+    owned = runtime.run_owned
+    for operation in ("scan", "trim"):
+        for outcome in ("completed", "spawn-failed", "failed", "interrupted"):
+            root = fresh(f"terminal-{operation}-{outcome}")
+            def execute(argv, *args, **kwargs):
+                if outcome == "spawn-failed":
+                    raise OSError("Controlled spawn failure")
+                started = kwargs["on_started"]
+                def on_started(pid, identity):
+                    started(pid, identity)
+                    if outcome == "failed":
+                        raise OSError("Controlled post-identity failure")
+                    if outcome == "interrupted":
+                        raise KeyboardInterrupt("Controlled interruption")
+                return owned(argv, *args, **{**kwargs, "on_started": on_started})
+            with patch.object(jobs, "MAX_REVISIONS", 4), patch.object(jobs, "MAX_METADATA_BYTES", 6500), \
+                    patch.object(runtime, "run_owned", side_effect=execute):
+                receipt = run(root, operation)
+                terminal = jobs.load_job(root)
+                assert terminal.runs[-1].execution == ("completed" if outcome == "completed" else "failed"), receipt
+                assert terminal.revision == (3 if outcome == "spawn-failed" else 4)
+                assert bool(receipt["version"]) == (operation == "trim" and outcome == "completed")
+                assert terminal.runs[-1].receipt_sha256 == jobs.digest(root / "runs" / terminal.latest_attempt / "receipt.json")
+                assert jobs.copy_job(root, temp / f"copy-terminal-{operation}-{outcome}") == terminal
+            unchanged(root)
+
+    # Interleave actual feedback API commits with the controller, before/after
+    # child identity. Byte refusal must happen while the requested snapshot fits.
+    for operation in ("scan", "trim"):
+        for ceiling in ("revisions", "bytes"):
+            for boundary in ("intent", "child"):
+                root = fresh(f"feedback-{operation}-{ceiling}-{boundary}")
+                accepted = []
+                def feedback_until_reserved():
+                    while True:
+                        current = jobs.load_job(root)
+                        note = "Concurrent wording " + "x" * 180
+                        item = jobs.Feedback(jobs.new_id(), current.current_version,
+                                             current.versions[0].sha256, "uncertain", note, "whole")
+                        proposal = replace(current, feedback=(*current.feedback, item))
+                        history = snapshot(root)
+                        try:
+                            result = jobs.record_feedback(root, version_id=current.current_version,
+                                category="uncertain", note=note, scope="whole",
+                                expected_revision=current.revision, expected_revision_sha256=current.revision_sha256)
+                        except ValueError:
+                            # Not an oversized input: shared commit must protect future growth.
+                            jobs.validate_job(proposal)
+                            rejected(lambda: jobs.commit_revision(root, proposal))
+                            assert snapshot(root) == history
+                            if ceiling == "revisions":
+                                rejected(lambda: jobs.commit_revision(root, replace(current,
+                                    policy=replace(current.policy, cpu_threads=3))), contains="headroom")
+                            break
+                        accepted.append(result.feedback[-1])
+                def execute(argv, *args, **kwargs):
+                    if boundary == "intent":
+                        feedback_until_reserved()
+                    started = kwargs["on_started"]
+                    def on_started(pid, identity):
+                        started(pid, identity)
+                        if boundary == "child":
+                            feedback_until_reserved()
+                    return owned(argv, *args, **{**kwargs, "on_started": on_started})
+                with patch.object(jobs, "MAX_REVISIONS", 6 if ceiling == "revisions" else 32), \
+                        patch.object(jobs, "MAX_METADATA_BYTES", 6500), \
+                        patch.object(runtime, "run_owned", side_effect=execute):
+                    receipt = run(root, operation)
+                    terminal = jobs.load_job(root)
+                    assert accepted and terminal.feedback == tuple(accepted)
+                    assert terminal.runs[-1].execution == "failed" and receipt["version"] is None
+                    assert jobs.copy_job(root, temp / f"copy-feedback-{operation}-{ceiling}-{boundary}") == terminal
+                unchanged(root)
+
+    # Real controller death, with and without an already-published success receipt.
+    for operation, mode in ((op, mode) for op in ("scan", "trim") for mode in ("interrupt", "crash")):
+        root = fresh(f"recover-{operation}-{mode}")
+        process = spawn(f"bounded-{operation}-{mode}", root)
+        try:
+            if mode == "crash":
+                wait_for(lambda: (root / "receipt-ready").exists(), process)
+                (root / "crash-now").touch()
+            finish(process, 25 if mode == "interrupt" else 24)
+            with patch.object(jobs, "MAX_REVISIONS", 4), patch.object(jobs, "MAX_METADATA_BYTES", 6500):
+                dead = jobs.load_job(root)
+                assert dead.runs[-1].execution == "running"
+                history = snapshot(root)
+                terminal = jobs.recover_run(root, dead.latest_attempt)
+                assert terminal.runs[-1].execution == ("interrupted" if mode == "interrupt" else "completed")
+                assert all(snapshot(root)[name] == data for name, data in history.items())
+                assert jobs.recover_run(root, dead.latest_attempt) == terminal
+                assert jobs.copy_job(root, temp / f"copy-recovered-{operation}-{mode}") == terminal
+            unchanged(root)
+        finally:
+            if process.poll() is None:
+                process.kill(); process.wait()
+    unchanged(base)
+    print("PASS reserved revisions/bytes: refusal, scan/render terminals, concurrent feedback and dead-run recovery", flush=True)
+
+
+def intent_status_checks(temp, source):
+    intents: tuple[jobs.Intent, ...] = ("music", "spoken_audio", "unknown")
+    for intent in intents:
+        for rap in (False, True):
+            root = temp / f"intent-{intent}-{rap}"
+            if rap:
+                cli("job", "create", source, root, "--intent", intent, "--wanted-vocals-may-include-rap")
+            else:
+                jobs.create_job(source, root, intent=intent, wanted_vocals_may_include_rap=rap)
+            original = jobs.load_job(root)
+            assert original.revision_sha256 is not None
+            copied = temp / f"intent-copy-{intent}-{rap}"
+            jobs.copy_job(root, copied)
+            for directory in (root, copied):
+                before = {p.relative_to(directory): jobs.digest(p) for p in directory.rglob("*") if p.is_file()}
+                with patch.object(runtime, "run_owned", side_effect=AssertionError("Status launched a worker")), \
+                     patch.object(subprocess, "Popen", side_effect=AssertionError("Status launched a process")):
+                    status = workflow.summarize_job(directory)
+                public = cli("job", "status", directory, "--json")
+                text = cli("job", "status", directory, raw=True)
+                assert all(public[key] == value for key, value in status.items())
+                assert status["intent"] == intent and status["wanted_vocals_may_include_rap"] is rap
+                assert f'intent: "{intent}"' in text
+                assert f'wanted_vocals_may_include_rap: {json.dumps(rap)}' in text
+                assert "recommendations:" in text
+                guidance = " ".join(status["recommendations"])
+                assert "CPU" in guidance and "CUDA only by explicit choice" in guidance
+                if intent == "music":
+                    assert "Music intent does not automatically select" in guidance
+                else:
+                    assert f"Recording intent is {intent}" in guidance
+                    assert "requires explicit selection" in guidance and "may remove wanted speech" in guidance
+                assert ("Wanted vocals may include rap" in guidance) is rap
+                if rap:
+                    assert "Do not use speech-stem reinsertion or denoise as restoration" in guidance
+                assert status["repair_status"] == "explicit_operation_required"
+                assert status["listening"] == "unreviewed" and public["listening_scope"] == "none"
+                assert jobs.load_job(directory) == original
+                assert before == {p.relative_to(directory): jobs.digest(p) for p in directory.rglob("*") if p.is_file()}
+            # Intent advice cannot override the existing feedback-based repair restriction.
+            jobs.record_feedback(root, version_id=original.versions[0].id, category="wanted_vocal_loss",
+                note="Wanted rap or speech is missing", scope="whole", expected_revision=original.revision,
+                expected_revision_sha256=original.revision_sha256)
+            before = jobs.load_job(root)
+            blocked = workflow.summarize_job(root)
+            assert blocked["repair_status"] == "no_supported_repair"
+            assert blocked["recommendations"] == status["recommendations"]
+            assert cli("job", "status", root, "--json")["repair_status"] == "no_supported_repair"
+            assert jobs.load_job(root) == before
+    assert not any(n == "torch" or n.startswith("torch.") or n == "songtool.separation" for n in sys.modules)
+    print("PASS intent/rap API, CLI and copied status: advisory only, no workers/models or approval changes", flush=True)
+
+
 def main():
     started = time.monotonic()
     assert shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg/ffprobe required"
@@ -583,6 +1110,11 @@ def main():
         source, silence = temp / "tone.wav", temp / "silence.wav"
         sf.write(source, audio, jobs.RATE, subtype="FLOAT")
         sf.write(silence, np.zeros_like(audio), jobs.RATE, subtype="FLOAT")
+        intent_status_checks(temp, source)
+        run_headroom_checks(temp, source)
+        clip_version_feedback_checks(temp, source)
+        feedback_scope_checks(temp, source)
+        render_activity_checks(temp, source)
         partial_diagnostic_copy_checks(temp, source)
         import_budget_checks(temp, source)
         a, b = temp / "a", temp / "b"
@@ -752,10 +1284,22 @@ def main():
                         "--start-frame", 0, "--end-frame", 70000)
         guarded = cli(*guarded_args)
         assert guarded["technical"] == "failed" and guarded["failure_kind"] == "guard"
-        assert guarded["version"] is None and not guarded["rendered_now"]
+        assert guarded["version"] is None and guarded["rendered_now"]
+        assert guarded["outcome"] == guarded["execution"] == "failed"
+        assert not guarded["listening_approved"]
+        diagnostic = a / "runs" / guarded["run"]["id"] / "worker" / "candidate.wav"
+        decoded, rate = sf.read(diagnostic, dtype="float64", always_2d=True)
+        assert rate == jobs.RATE and np.array_equal(decoded, (parent * 12)[:70000])
+        acknowledgement = guarded["render_acknowledgement"]
+        assert acknowledgement == read(diagnostic.parent / "render-complete.json")
+        assert acknowledgement["frames"] == len(decoded) == 70000
+        assert acknowledgement["encoding"] == sf.info(diagnostic).subtype == "DOUBLE"
+        assert acknowledgement["audio_sha256"] == jobs.digest(diagnostic)
+        assert acknowledgement["run_id"] == guarded["run"]["id"]
         after_guard = jobs.load_job(a)
         assert after_guard.versions == before_guard.versions
         assert after_guard.current_version == before_guard.current_version
+        assert after_guard.latest_technically_passed_candidate == before_guard.latest_technically_passed_candidate
         cli(*guarded_args, "--retry-reason", "must not bypass guards", ok=False)
         guard_status = cli("job", "status", a, "--json")
         guard_plain = cli("job", "status", a, raw=True)
@@ -767,11 +1311,15 @@ def main():
         with patch.object(runtime, "run_owned", side_effect=OSError("injected spawn failure")):
             failure = workflow.run_operation(b, "scan")
         assert failure["failure_kind"] == "operational" and failure["execution"] == "failed"
+        assert not failure["rendered_now"] and failure["render_acknowledgement"] is None
         rejected(lambda: workflow.run_operation(b, "scan"), contains="failed attempt")
         retry = workflow.run_operation(b, "scan", retry_reason="controlled failure removed")
         assert retry["execution"] == "completed" and retry["outcome"] == "analyzed_only"
         assert workflow.run_operation(b, "scan")["outcome"] == "reused_result"
         tree_checks(temp)
+        from verify_owned_runtime import check_controller_death
+        check_controller_death()
+        owned_recovery_checks(temp, source)
         print("PASS failed retry/reuse and real timeout/cancel child+grandchild teardown", flush=True)
 
         controller = spawn("crash", b)

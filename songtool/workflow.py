@@ -65,6 +65,27 @@ def _parameters(operation, parameters, parent):
     return p
 
 
+def _unsupported_feedback(job: jobs.Job, target: jobs.Version) -> bool:
+    """Only surviving source frames carry ancestral repair-blocking feedback."""
+    ancestors = {}
+    cursor = target
+    while True:
+        ancestors[cursor.id] = cursor
+        if cursor.parent_id is None:
+            break
+        cursor = _parent(job, cursor.parent_id)
+    for item in job.feedback:
+        if item.version_id not in ancestors or item.category not in (
+                "wanted_vocal_loss", "warbling_reverse_like_artifact"):
+            continue
+        origin = ancestors[item.version_id]
+        first = origin.source_start_frame + (item.start_frame if item.scope == "interval" else 0)
+        last = origin.source_start_frame + (item.end_frame if item.scope == "interval" else origin.frames)
+        if max(first, target.source_start_frame) < min(last, target.source_start_frame + target.frames):
+            return True
+    return False
+
+
 def summarize_job(directory: Path, version_id: str = "current") -> dict:
     job = jobs.load_job(directory)
     parent = _parent(job, version_id)
@@ -73,8 +94,7 @@ def summarize_job(directory: Path, version_id: str = "current") -> dict:
     while cursor.parent_id:
         ancestors.add(cursor.parent_id)
         cursor = _parent(job, cursor.parent_id)
-    unsupported = [f.category for f in job.feedback if f.version_id in ancestors and
-                   f.category in ("wanted_vocal_loss", "warbling_reverse_like_artifact")]
+    unsupported = _unsupported_feedback(job, parent)
     legacy = []
     for run in job.runs:
         if run.parent_id in ancestors and run.receipt_sha256:
@@ -85,8 +105,22 @@ def summarize_job(directory: Path, version_id: str = "current") -> dict:
                                "operation": run.operation, "fingerprint": run.fingerprint,
                                "failure_reason": receipt["error"],
                                "attestation": receipt["legacy_evidence"]["attestation"]})
+    recommendations = [
+        "Select any operation explicitly; job runs default to CPU, with CUDA only by explicit choice for Bandit."]
+    if job.intent == "music":
+        recommendations.append("Music intent does not automatically select music-specific separation or promise better sound.")
+    else:
+        recommendations.append(
+            f"Recording intent is {job.intent}; music-specific separation (Bandit) requires explicit selection "
+            "and may remove wanted speech. Tracking and scanning remain available; separation quality is not promised.")
+    if job.wanted_vocals_may_include_rap:
+        recommendations.append(
+            "Wanted vocals may include rap; preserve wanted vocals. Do not use speech-stem reinsertion "
+            "or denoise as restoration of missing wanted vocals; restoration needs new capability.")
     latest = next((r for r in job.runs if r.id == job.latest_attempt), None)
     return {"job_id": job.id, "current_version": job.current_version,
+            "intent": job.intent, "wanted_vocals_may_include_rap": job.wanted_vocals_may_include_rap,
+            "recommendations": recommendations,
             "selected_version": parent.id, "legacy_failed_evidence": legacy,
             "legacy_recommendation": "Exact historical treatment is barred; no generic recipe equivalence is implied."
                                      if legacy else None,
@@ -378,7 +412,13 @@ def _worker(directory, run_id):
                     processed = original + (processed-original) * c.eq_mask(0, len(original), tuple(map(tuple, p["intervals"])))
             if op != "trim":
                 processed, _ = _preserve(original, processed, intent["protected_intervals"])
-            _write_audio(output / "candidate.wav", processed)
+            audio_sha256 = _write_audio(output / "candidate.wav", processed)
+            _publish(output / "render-complete.json", {
+                "schema_version": 1, "job_id": job.id, "source_sha256": job.source.sha256,
+                "run_id": run.id, "fingerprint": run.fingerprint,
+                "parent_id": parent.id, "parent_sha256": parent.sha256,
+                "audio_sha256": audio_sha256, "encoding": "DOUBLE", "frames": len(processed)},
+                limit=4096)
             verification = validate_result(source, output / "candidate.wav", operation=op,
                                           parameters=p, protected_intervals=intent["protected_intervals"])
         c.require(c.digest(source) == parent.sha256, "Parent changed during work.")
@@ -401,13 +441,7 @@ def run_operation(directory: Path, operation: str, version_id: str = "current", 
               "Protection changed; describe again.")
     c.require(not any(r.execution == "running" for r in job.runs), "One active run per job; recover dead runs explicitly.")
     if operation == "gentle-denoise":
-        ancestors = {parent.id}
-        cursor = parent
-        while cursor.parent_id:
-            ancestors.add(cursor.parent_id)
-            cursor = _parent(job, cursor.parent_id)
-        c.require(not any(f.version_id in ancestors and f.category in
-                         ("wanted_vocal_loss", "warbling_reverse_like_artifact") for f in job.feedback),
+        c.require(not _unsupported_feedback(job, parent),
                   "no_supported_repair: denoise cannot restore wanted vocals or reverse-like artifacts.")
     if retry_reason is not None:
         jobs._text(retry_reason, "operational retry reason", 2000)
@@ -435,13 +469,15 @@ def run_operation(directory: Path, operation: str, version_id: str = "current", 
         jobs._integer(timeout, 1, policy.wall_time_seconds, "timeout")
         policy = replace(policy, wall_time_seconds=timeout)
     run = jobs.Run(jobs.new_id(), operation, intent["fingerprint"], parent.id, parent.sha256, device=device)
+    pending = replace(job, runs=(*job.runs, run), latest_attempt=run.id)
+    jobs._check_run_headroom(replace(pending, revision=job.revision + 1))
     run_dir = root / "runs" / run.id
     run_dir.mkdir(exist_ok=False)
     controller = {"pid": os.getpid(), "identity": runtime.process_identity(os.getpid())}
     c.require(controller["identity"] is not None, "Controller identity unavailable.")
     _publish(run_dir / "intent.json", {**intent, "retry_reason": retry_reason, "controller": controller})
     _publish(run_dir / "incomplete.json", {"job_id": job.id, "run_id": run.id})
-    job = jobs.commit_revision(root, replace(job, runs=(*job.runs, run), latest_attempt=run.id))
+    job = jobs.commit_revision(root, pending)
     def started(pid, identity):
         nonlocal job, run
         run = replace(run, process_id=pid, process_identity=identity)
@@ -459,6 +495,13 @@ def run_operation(directory: Path, operation: str, version_id: str = "current", 
             error = "Missing technical verification"
     except BaseException as exception:
         error = f"{type(exception).__name__}: {str(exception)[:2000]}"
+    render_acknowledgement = None
+    try:
+        render_acknowledgement = jobs._render_acknowledgement(root, job, run)
+        if operation != "scan" and verification and verification["technical"] == "passed":
+            c.require(render_acknowledgement is not None, "Missing render acknowledgement.")
+    except Exception as exception:
+        error = f"Render acknowledgement invalid: {str(exception)[:2000]}"
     passed = error is None and verification is not None and verification["technical"] == "passed"
     failure_kind = None if passed else "guard" if verification and verification["technical"] == "failed" else "operational"
     # Reload for concurrent feedback; intent/protection changes cannot be silently ignored.
@@ -498,7 +541,8 @@ def run_operation(directory: Path, operation: str, version_id: str = "current", 
                    ((root / candidate.path).stat().st_size if candidate else 0),
                "execution": run.execution, "technical": run.technical, "listening": "unreviewed",
                "outcome": "analyzed_only" if passed and operation == "scan" else "rendered_new" if passed else "failed",
-               "rendered_now": bool(passed and operation != "scan"), "listening_approved": False}
+               "render_acknowledgement": render_acknowledgement,
+               "rendered_now": render_acknowledgement is not None, "listening_approved": False}
     sha = _publish(run_dir / "receipt.json", receipt)
     run = replace(run, receipt_sha256=sha)
     jobs.commit_revision(root, replace(current, runs=tuple(run if r.id == run.id else r for r in current.runs),

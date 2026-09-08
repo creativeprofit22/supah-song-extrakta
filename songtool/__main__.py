@@ -125,7 +125,9 @@ def _job_parser(commands):
                 "good", "residual_dialogue", "wanted_vocal_loss", "muffling", "warbling_reverse_like_artifact", "noise", "uncertain")
             command.add_argument("--verdict", choices=choices, required=True)
         if name == "feedback":
-            command.add_argument("--clip", required=True)
+            command.add_argument("--clip", required=True, help="Stable clip id from the scan or clips report")
+            command.add_argument("--version", metavar="ID",
+                                 help="Exact version_id from that clip; required when its ID matches multiple versions")
             command.add_argument("--accepted", action="store_true")
         if name == "recover":
             command.add_argument("--run", required=True)
@@ -154,6 +156,9 @@ def _feedback_clip(args):
     from . import jobs, review
     job = jobs.load_job(args.directory)
     jobs._id(args.clip)
+    if args.version is not None:
+        jobs._id(args.version)
+        jobs.require(any(v.id == args.version for v in job.versions), "Unknown feedback version ID in this job.")
     found = None
     root = jobs._plain(args.directory / "runs", directory=True)
     count = 0
@@ -181,9 +186,13 @@ def _feedback_clip(args):
                 jobs._integer(last, first + 1, version.frames, "clip end")
                 expected = review._clip(version, first, last)
                 jobs.require(all(clip.get(k) == v for k, v in expected.items()), "Invalid stable clip map.")
-                jobs.require(found is None or found == expected, "Ambiguous clip ID across versions.")
+                if args.version is not None and clip["version_id"] != args.version:
+                    continue
+                jobs.require(found is None or found == expected,
+                             "Ambiguous clip ID across versions; pass --version ID using the clip's version_id from the scan or clips report.")
                 found = expected
-    jobs.require(found is not None, "Unknown stable clip ID.")
+    jobs.require(found is not None, "Unknown stable clip ID for the selected version." if args.version is not None
+                 else "Unknown stable clip ID.")
     return jobs.record_feedback(args.directory, version_id=found["version_id"], category=args.verdict,
         note=args.note, scope="interval", start_frame=found["start_frame"],
         end_frame=found["end_frame_exclusive"], accepted=args.accepted,

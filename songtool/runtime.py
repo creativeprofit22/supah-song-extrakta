@@ -199,9 +199,26 @@ def _bytes(directory: Path) -> int:
     return total
 
 
+def _group_alive(pid):
+    """Linux group check, including descendants whose leader has already exited."""
+    # simplification: owned workers do not detach; use cgroups for daemonizing
+    # executables. The subreaper still retains the lease if an adoptee survives.
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if int(fields[2]) == pid and fields[0] != "Z":
+            return True
+    return False
+
+
 class _Tree:
     def __init__(self):
         self.job = None
+        self.handles = {}
         if os.name == "nt":
             self.job = _checked(_create_job(None, None))
             limits = _Extended()
@@ -217,71 +234,55 @@ class _Tree:
             _checked(_assign(self.job, int(process._handle)))
 
     def stop(self, process):
-        try:
-            if self.job:
-                # ActiveProcesses can reach zero before process handles signal.
-                # Retain handles to all members so teardown waits for real exit.
-                class Members(ctypes.Structure):
-                    _fields_ = [("assigned", w.DWORD), ("count", w.DWORD),
-                                ("pids", ctypes.c_size_t * 65536)]
-                members = Members()
-                handles = []
-                try:
-                    _checked(_query(self.job, 3, ctypes.byref(members), ctypes.sizeof(members), None))
-                    for pid in members.pids[:members.count]:
-                        handle = _open(0x100000, False, pid)
-                        if handle:
-                            handles.append(handle)
-                        elif ctypes.get_last_error() != 87:
-                            raise ctypes.WinError(ctypes.get_last_error())
-                    _checked(_terminate(self.job, 1))
-                    for handle in handles:
-                        if _wait(handle, 10000) != 0:
-                            raise RuntimeError("Owned process did not signal exit")
-                finally:
-                    for handle in handles:
-                        _close(handle)
-                deadline = time.monotonic() + 10
-                while True:
-                    info = _Accounting()
-                    _checked(_query(self.job, 1, ctypes.byref(info), ctypes.sizeof(info), None))
-                    if not info.active:
-                        break
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError("Owned Windows process tree did not terminate")
-                    time.sleep(0.01)
-            elif process is not None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                # Linux can verify descendants even after the leader exits.
-                deadline = time.monotonic() + 10
-                while True:
-                    live = False
-                    for entry in Path("/proc").iterdir():
-                        if not entry.name.isdecimal():
-                            continue
-                        try:
-                            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                        except (FileNotFoundError, ProcessLookupError):
-                            continue
-                        if int(fields[2]) == process.pid and fields[0] != "Z":
-                            live = True
-                            break
-                    if not live:
-                        break
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError("Owned POSIX process group did not terminate")
-                    time.sleep(0.01)
-        finally:
-            if process is not None:
-                if process.poll() is None:
-                    process.kill()  # also handles failure before job assignment
-                process.wait()
-            if self.job:
-                _close(self.job)
-                self.job = None
+        # Do not close ownership handles on failure: the guardian retries while
+        # holding its lease, including when ActiveProcesses precedes real exit.
+        if self.job:
+            class Members(ctypes.Structure):
+                _fields_ = [("assigned", w.DWORD), ("count", w.DWORD),
+                            ("pids", ctypes.c_size_t * 65536)]
+            members = Members()
+            _checked(_query(self.job, 3, ctypes.byref(members), ctypes.sizeof(members), None))
+            for pid in members.pids[:members.count]:
+                if pid in self.handles:
+                    continue
+                handle = _open(0x100000, False, pid)
+                if handle:
+                    self.handles[pid] = handle
+                elif ctypes.get_last_error() != 87:
+                    raise ctypes.WinError(ctypes.get_last_error())
+            _checked(_terminate(self.job, 1))
+            for handle in self.handles.values():
+                if _wait(handle, 10000) != 0:
+                    raise RuntimeError("Owned process did not signal exit")
+            deadline = time.monotonic() + 10
+            while True:
+                info = _Accounting()
+                _checked(_query(self.job, 1, ctypes.byref(info), ctypes.sizeof(info), None))
+                if not info.active:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Owned Windows process tree did not terminate")
+                time.sleep(0.01)
+        elif process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 10
+            while _group_alive(process.pid):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Owned POSIX process group did not terminate")
+                time.sleep(0.01)
+        if process is not None:
+            if process.poll() is None:
+                process.kill()  # also handles failure before job assignment
+            process.wait()
+        if self.job:
+            for handle in self.handles.values():
+                _close(handle)
+            self.handles.clear()
+            _close(self.job)
+            self.job = None
 
 
 _BOOTSTRAP = """import os,sys,subprocess
@@ -294,7 +295,7 @@ sys.exit(subprocess.call(args,stdin=subprocess.DEVNULL))
 
 
 def run_owned(argv: list[str], output: Path, *, workspace: Path,
-              policy: ResourcePolicy | None = None, device: str = "cpu",
+              policy: ResourcePolicy | _DefaultPolicy | None = None, device: str = "cpu",
               cancel: threading.Event | None = None,
               on_started: Callable[[int, str], None] | None = None,
               log_limit: int = 1024 * 1024, poll_seconds: float = 0.05) -> RuntimeResult:
@@ -339,9 +340,121 @@ def run_owned(argv: list[str], output: Path, *, workspace: Path,
     marker = output / "inference-started"
     env["SONGTOOL_INFERENCE_MARKER"] = str(marker)
     env["SONGTOOL_OUTPUT_DIRECTORY"] = str(output)
+    result = _supervise(argv, output, workspace, env, policy, device, cancel,
+                        on_started, log_limit, poll_seconds)
+    with (output / "runtime.json").open("x", encoding="utf-8") as stream:
+        json.dump(asdict(result), stream, indent=2, allow_nan=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return result
+
+
+def _record(path, value):
+    with path.open("x", encoding="utf-8") as stream:
+        json.dump(value, stream, allow_nan=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _supervise(argv, output, workspace, env, policy, device, cancel, on_started,
+               log_limit, poll_seconds):
+    # Only this controller holds the write end. Neither guardian nor workers
+    # inherit it: EOF survives os._exit/SIGKILL, unlike controller finally blocks.
+    start = time.monotonic()
+    guardian = subprocess.Popen([sys.executable, "-B", "-m", "songtool.runtime", str(output)],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env=env, close_fds=True,
+                                start_new_session=os.name != "nt")
+    requested_status = None
+    try:
+        identity = process_identity(guardian.pid)
+        if identity is None:
+            raise RuntimeError("Guardian died before ownership publication")
+        _record(output / "guardian.json", {"pid": guardian.pid, "identity": identity})
+        configuration = {"argv": argv, "workspace": str(workspace),
+                         "policy": asdict(policy), "device": device,
+                         "log_limit": log_limit, "poll_seconds": poll_seconds}
+        guardian.stdin.write(json.dumps(configuration).encode() + b"\n")
+        guardian.stdin.flush()
+        released = False
+        while guardian.poll() is None:
+            if cancel is not None and cancel.is_set():
+                requested_status = "cancelled"
+                break
+            if time.monotonic() - start >= policy.wall_time_seconds:
+                requested_status = "timed_out"
+                break
+            if not released and (output / "guardian-ready").exists():
+                if on_started:
+                    on_started(guardian.pid, identity)
+                guardian.stdin.write(b"G")
+                guardian.stdin.flush()
+                released = True
+            time.sleep(poll_seconds)
+    finally:
+        # Never kill the guardian to implement a timeout: it owns teardown and
+        # retains the lease if the kernel cannot yet stop an owned descendant.
+        try:
+            guardian.stdin.close()
+        except BrokenPipeError:
+            pass
+        guardian.wait()
+    error_path = output / "guardian-error.json"
+    if error_path.exists():
+        raise RuntimeError(json.loads(error_path.read_text(encoding="utf-8"))["error"])
+    if guardian.returncode != 0:
+        raise RuntimeError("Guardian failed; ownership requires explicit recovery")
+    data = json.loads((output / "guardian-result.json").read_text(encoding="utf-8"))
+    if requested_status:
+        data["status"] = requested_status
+    data["elapsed_seconds"] = time.monotonic() - start
+    return RuntimeResult(**data)
+
+
+def _guardian(output):
     from contextlib import nullcontext
-    with gpu_lease(workspace) if device == "cuda" else nullcontext():
-        return _run(argv, output, env, policy, device, cancel, on_started, log_limit, poll_seconds, marker)
+    config_line = sys.stdin.buffer.readline()
+    if not config_line:
+        return  # Controller died before publishing configuration; no worker exists.
+    config = json.loads(config_line)
+    policy = _DefaultPolicy(**config["policy"])
+    cancelled, released = threading.Event(), threading.Event()
+
+    def watch_controller():
+        try:
+            # Raw reads avoid holding Python's buffered-stdin lock during
+            # normal interpreter shutdown while the controller is still alive.
+            if os.read(sys.stdin.fileno(), 1) == b"G":
+                released.set()
+                os.read(sys.stdin.fileno(), 1)  # EOF (or any further byte) means stop.
+        finally:
+            cancelled.set()
+            released.set()
+
+    threading.Thread(target=watch_controller, daemon=True).start()
+
+    def ready(pid, identity):
+        (output / "guardian-ready").touch(exist_ok=False)
+        if not released.wait(policy.wall_time_seconds):
+            cancelled.set()
+
+    try:
+        if sys.platform.startswith("linux"):
+            # Adopt/reap orphaned grandchildren, not just the direct worker.
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+            prctl = libc.prctl
+            prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+            prctl.restype = ctypes.c_int
+            if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+                raise OSError(ctypes.get_errno(), "Cannot establish owned subreaper")
+        with gpu_lease(Path(config["workspace"])) if config["device"] == "cuda" else nullcontext():
+            result = _run(config["argv"], output, os.environ.copy(), policy, config["device"],
+                          cancelled, ready, config["log_limit"], config["poll_seconds"],
+                          output / "inference-started")
+            _record(output / "guardian-result.json", asdict(result))
+    except BaseException as error:
+        _record(output / "guardian-error.json", {"error": f"{type(error).__name__}: {str(error)[:2000]}"})
 
 
 def _run(argv, output, env, policy, device, cancel, on_started, log_limit, poll_seconds, marker):
@@ -354,9 +467,10 @@ def _run(argv, output, env, policy, device, cancel, on_started, log_limit, poll_
     with (output / "worker.log").open("xb") as log:
         tree = _Tree()
         try:
+            (output / "guardian-started").touch(exist_ok=False)
             process = subprocess.Popen([sys.executable, "-B", "-c", _BOOTSTRAP, *argv],
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, env=env, shell=False,
+                                       stderr=subprocess.STDOUT, env=env, shell=False, close_fds=True,
                                        start_new_session=os.name != "nt")
             tree.attach(process)
             identity = process_identity(process.pid)
@@ -400,12 +514,35 @@ def _run(argv, output, env, policy, device, cancel, on_started, log_limit, poll_
                     break
                 if errors:
                     raise RuntimeError("Worker log write failed") from errors[0]
-                if process.poll() is not None:
-                    status = "completed" if process.returncode == 0 else "failed"
+                if os.name == "nt":
+                    code = process.poll()
+                else:
+                    # Keep the leader unreaped, pinning its PID/process group
+                    # until killpg and descendant verification have finished.
+                    exited = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    code = (0 if exited.si_code == os.CLD_EXITED and exited.si_status == 0 else 1) if exited else None
+                if code is not None:
+                    status = "completed" if code == 0 else "failed"
                     break
                 time.sleep(poll_seconds)
         finally:
-            tree.stop(process)
+            while True:
+                try:
+                    tree.stop(process)
+                    break
+                except (OSError, RuntimeError):
+                    # Fail closed: retain guardian identity and GPU lease until
+                    # the exact owned tree really stops (e.g. uninterruptible I/O).
+                    time.sleep(poll_seconds)
+            if sys.platform.startswith("linux"):
+                # The guardian is a subreaper; all adopted children must be dead
+                # and reaped before it releases either ownership or the lease.
+                while True:
+                    try:
+                        os.waitpid(-1, 0)
+                    except ChildProcessError:
+                        break
+            (output / "guardian-stopped").touch(exist_ok=False)
             if process is not None:
                 if process.stdin and not process.stdin.closed:
                     process.stdin.close()
@@ -419,11 +556,10 @@ def _run(argv, output, env, policy, device, cancel, on_started, log_limit, poll_
     size = _bytes(output)
     if size > policy.max_output_bytes:
         status = "output_limit"
-    result = RuntimeResult(status, process.returncode, time.monotonic() - start, device,
-                           process.pid, identity, size, *counts,
-                           True if marker.is_file() else "unavailable")
-    with (output / "runtime.json").open("x", encoding="utf-8") as stream:
-        json.dump(asdict(result), stream, indent=2, allow_nan=False)
-        stream.flush()
-        os.fsync(stream.fileno())
-    return result
+    return RuntimeResult(status, process.returncode, time.monotonic() - start, device,
+                         process.pid, identity, size, *counts,
+                         True if marker.is_file() else "unavailable")
+
+
+if __name__ == "__main__":
+    _guardian(Path(sys.argv[1]))
