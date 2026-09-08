@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local A/B preview</title>
+<style>
+  body { font: 1rem/1.5 "Segoe UI", sans-serif; color: #222; background: #fff; margin: 0; }
+  main { max-width: 42rem; margin: 2rem auto; padding: 0 1rem; overflow-wrap: anywhere; }
+  h1 { font-size: 1.5rem; }
+  .controls { display: flex; flex-wrap: wrap; gap: .5rem; margin-block: 1rem; }
+  button { font: inherit; min-height: 44px; padding: .4rem .85rem; cursor: pointer; }
+  button:focus-visible { outline: 3px solid #1456a0; outline-offset: 3px; }
+  button[aria-pressed="true"] { font-weight: bold; border: 3px solid currentColor; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+</style>
+<main data-blind-ab>
+  <h1>Local A/B preview</h1>
+  <p data-scope>Loading exact source scope…</p>
+  <p data-status role="status" aria-live="polite">Loading both versions. Playback is disabled.</p>
+  <div class="controls" aria-label="Playback controls">
+    <button data-slot="A" aria-pressed="true" disabled>A (selected)</button>
+    <button data-slot="B" aria-pressed="false" disabled>B</button>
+    <button data-play disabled>Play</button>
+  </div>
+  <p data-position>Elapsed: 0.000 s</p>
+  <button data-reveal disabled>Reveal identities</button>
+  <pre data-identities></pre>
+  <p>Unadjusted loudness; float32 browser playback, not bit-perfect monitoring.
+    Hard switches can click: a transition artifact does not prove either version is defective or different.</p>
+  <p>Reveal is permanent for this session. Refresh keeps the assignment and revealed state.
+    Nothing is rated, saved, accepted or approved. No whole-song judgment is recorded.</p>
+  <noscript>JavaScript and Web Audio are required. No external player will be opened.</noscript>
+</main>
+<script src="blind_ab.js" defer></script>
+</html>

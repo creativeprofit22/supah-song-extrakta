@@ -97,6 +97,12 @@ def _job_parser(commands):
     create.add_argument("directory", type=Path)
     create.add_argument("--intent", choices=("music", "spoken_audio", "unknown"), required=True)
     create.add_argument("--wanted-vocals-may-include-rap", action="store_true")
+    blind = actions.add_parser("blind-ab", help="Read-only, memory-only blind A/B preview; no approval")
+    blind.add_argument("directory", type=Path)
+    blind.add_argument("--version-one", required=True, help="Exact registered ID, not current")
+    blind.add_argument("--version-two", required=True, help="Distinct exact registered ID")
+    blind.add_argument("--source-start-frame", required=True, type=int, help="Inclusive canonical-source 48 kHz frame")
+    blind.add_argument("--source-end-frame", required=True, type=int, help="Exclusive frame; 1–2,880,000 selected frames")
     for name in ("status", "scan", "feedback", "run", "choose", "open", "recover", "copy"):
         command = actions.add_parser(name)
         command.add_argument("directory", type=Path)
@@ -202,6 +208,13 @@ def _feedback_clip(args):
 def _job_command(args):
     from . import jobs, workflow, review
     action = args.job_command
+    if action == "blind-ab":
+        from .blind_ab import prepare_session, serve_session
+        session = prepare_session(args.directory, args.version_one, args.version_two,
+                                  source_start_frame=args.source_start_frame,
+                                  source_end_frame=args.source_end_frame)
+        serve_session(session)
+        return
     if action == "create":
         job = jobs.create_job(args.source, args.directory, intent=args.intent,
                              wanted_vocals_may_include_rap=args.wanted_vocals_may_include_rap)

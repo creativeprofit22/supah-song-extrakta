@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speaker-free A/B checks</title>
+<h1>Speaker-free A/B checks</h1>
+<p>Uses the production controls and a recording context, never a speaker. The last synthetic preview remains for keyboard, zoom and narrow-layout checks.</p>
+<p id="results" role="status">Running…</p>
+<div id="fixtures"></div>
+<script src="blind_ab.js"></script>
+<script>
+"use strict";
+(async () => {
+  let passed = 0, failed = 0;
+  const errors = [];
+  function check(value, message) {
+    if (value) passed++; else { failed++; errors.push(message); }
+  }
+  const html = await (await fetch("blind_ab.html", {cache: "no-store"})).text();
+  const page = new DOMParser().parseFromString(html, "text/html");
+  document.head.append(page.querySelector("style").cloneNode(true));
+  const fixtures = document.getElementById("fixtures");
+  function create(options = {}) {
+    const root = page.querySelector("main").cloneNode(true);
+    root.removeAttribute("data-blind-ab"); fixtures.append(root);
+    const calls = [], contexts = [], requests = [], frames = 8;
+    let callbacks = [], timerId = 0;
+    const timers = new Map(), events = new EventTarget(), visibility = new EventTarget();
+    visibility.visibilityState = "visible";
+    const server = options.server || {revealed: !!options.revealed};
+    const identity = options.reverse ? {A: {version_id: "b".repeat(32), sha256: "2".repeat(64)}, B: {version_id: "a".repeat(32), sha256: "1".repeat(64)}} :
+      {A: {version_id: "a".repeat(32), sha256: "1".repeat(64)}, B: {version_id: "b".repeat(32), sha256: "2".repeat(64)}};
+    class RecordingContext {
+      constructor(config) {
+        check(config.sampleRate === 48000, "explicit requested rate");
+        this.sampleRate = options.badRate ? 44100 : 48000;
+        this.currentTime = 10; this.destination = {}; this.sources = []; this.gains = [];
+        contexts.push(this);
+      }
+      createBuffer(channels, count, rate) {
+        check(channels === 2 && count === frames && rate === 48000, "exact buffer shape");
+        const data = [new Float32Array(count), new Float32Array(count)];
+        return {data, getChannelData: (channel) => data[channel]};
+      }
+      createBufferSource() {
+        const index = this.sources.length;
+        const node = {connect() {}, disconnect() {}, stop() {calls.push(["stop", index]);},
+          start(...args) { calls.push(["start", index, ...args]); }, onended: null};
+        this.sources.push(node); return node;
+      }
+      createGain() {
+        const index = this.gains.length;
+        const gain = {connect() {}, disconnect() {}, gain: {setValueAtTime(value, time) {calls.push(["gain", index, value, time]);}}};
+        this.gains.push(gain); return gain;
+      }
+      async resume() { calls.push(["resume"]); if (options.resumeFailure) throw new Error("private-path"); }
+      async suspend() { calls.push(["suspend"]); }
+      async close() { calls.push(["close"]); }
+    }
+    async function request(route, init) {
+      requests.push([route, init]);
+      if (options.fetchFailure && route === "B") throw new Error("private-path");
+      if (route === "session") {
+        const data = {frames, channels: 2, sample_rate: 48000,
+          source_start_frame: 23, source_end_frame: 23 + frames, loading: false, revealed: server.revealed};
+        if (options.sessionResponse) return options.sessionResponse(data, init.signal);
+        return {ok: true, json: async () => data};
+      }
+      if (route === "reveal") {
+        server.revealed = true;
+        if (options.postFailure === "reject") throw new Error("private-path");
+        return {ok: true, json: async () => {
+          if (options.postFailure === "json") throw new SyntaxError("private-path");
+          return identity;
+        }};
+      }
+      if (route === "B" && options.loadingGate) await options.loadingGate;
+      const count = options.truncated && route === "B" ? frames - 1 : frames;
+      const bytes = new ArrayBuffer(count * 8), view = new DataView(bytes);
+      for (let i = 0; i < count * 2; i++) view.setFloat32(i * 4, (options.identical || route === "A" ? 1 : -1) * i / 100, true);
+      return {ok: true, arrayBuffer: async () => bytes};
+    }
+    const controller = mountBlindAB(root, {fetch: request, AudioContext: options.unsupported ? null : RecordingContext,
+      requestAnimationFrame: (callback) => { callbacks.push(callback); return callbacks.length; },
+      cancelAnimationFrame() {}, window: events, document: visibility,
+      setTimeout(callback, delay) {timers.set(++timerId, {callback, delay}); return timerId;},
+      clearTimeout(id) {timers.delete(id);}});
+    return {root, controller, calls, contexts, requests, identity, timers,
+      focus() {events.dispatchEvent(new Event("focus"));},
+      visibility(value) {visibility.visibilityState = value; visibility.dispatchEvent(new Event("visibilitychange"));},
+      timer(delay) {
+        const entry = [...timers].find(([, timer]) => timer.delay === delay);
+        check(!!entry, `scheduled ${delay}ms timer`);
+        if (entry) {timers.delete(entry[0]); entry[1].callback();}
+      },
+      tick() {const pending = callbacks; callbacks = []; pending.forEach((callback) => callback());},
+      remove() {controller.dispose(); root.remove();}};
+  }
+  try {
+    for (const reverse of [false, true]) {
+      for (const identical of [false, true]) {
+        const test = create({reverse, identical});
+        await test.controller.ready;
+        const find = (name) => test.root.querySelector(`[data-${name}]`);
+        check(!find("play").disabled && test.contexts.length === 0, "both loaded without autoplay/context");
+        check(!test.requests.some(([route]) => route === "reveal"), "no preloaded identity request");
+        check(!test.root.textContent.includes("a".repeat(32)), "actual DOM blind");
+        await Promise.all([test.controller.toggle(), test.controller.toggle(), test.controller.toggle()]);
+        const starts = test.calls.filter(([name]) => name === "start");
+        check(starts.length === 2 && test.contexts.length === 1, "rapid play creates only one pair/context");
+        check(JSON.stringify(starts[0].slice(2)) === JSON.stringify(starts[1].slice(2)), "same start/offset/duration");
+        check(starts[0][3] === 0 && starts[0][4] === 8 / 48000, "exact offset/duration");
+        const context = test.contexts[0];
+        check(context.sources[0].buffer.data[0][1] === Math.fround(.02), "interleaved channel A mapping");
+        check(context.sources[1].buffer.data[1][1] === Math.fround(identical ? .03 : -.03), "interleaved channel B mapping");
+        for (const slot of ["B", "A", "B", "A", "B"]) test.root.querySelector(`[data-slot="${slot}"]`).click();
+        const gains = test.calls.filter(([name]) => name === "gain");
+        for (let i = 0; i < gains.length; i += 2) {
+          check(gains[i][2] + gains[i + 1][2] === 1 && gains[i][3] === gains[i + 1][3], "complementary simultaneous gains");
+        }
+        check(test.calls.filter(([name]) => name === "start").length === 2 && context.currentTime === 10, "switching leaves transport untouched");
+        await Promise.all([test.controller.toggle(), test.controller.toggle()]);
+        check(test.calls.filter(([name]) => name === "suspend").length === 1 && find("status").textContent.includes("Paused"), "pause one context once");
+        await test.controller.toggle();
+        check(test.calls.filter(([name]) => name === "start").length === 2, "resume does not restart nodes");
+        const schedule = JSON.stringify(test.calls);
+        find("reveal").click();
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+        check(find("identities").textContent === JSON.stringify(test.identity, null, 2), "click reveals exact assignment");
+        check(JSON.stringify(test.calls) === schedule, "reveal leaves schedule and selection unchanged");
+        check(test.requests.filter(([route, init]) => route === "reveal" && init.method === "POST").length === 1, "explicit POST only");
+        const endA = context.sources[0].onended, endB = context.sources[1].onended;
+        context.currentTime = 999; endA(); endB(); test.tick();
+        check(find("status").textContent.includes("Ended") && find("position").textContent.endsWith("source frame 31"), "idempotent end and clamped source position");
+        await test.controller.toggle();
+        check(test.calls.filter(([name]) => name === "start").length === 4, "replay starts fresh pair");
+        endA(); check(find("status").textContent.includes("Playing"), "stale ended event ignored");
+        test.remove();
+      }
+    }
+    for (const option of ["fetchFailure", "truncated", "badRate", "resumeFailure", "unsupported"]) {
+      const test = create({[option]: true}); await test.controller.ready;
+      if (option === "badRate" || option === "resumeFailure") await test.controller.toggle();
+      check(test.root.querySelector("[data-play]").disabled && test.root.querySelector("[data-status]").textContent.includes("Error"), `${option} disables playback`);
+      check(!test.root.textContent.includes("private-path") && test.calls.every(([name]) => name !== "start"), `${option} no identity or one-sided playback`);
+      test.remove();
+    }
+    const refreshed = create({revealed: true}); await refreshed.controller.ready;
+    check(refreshed.root.querySelector("[data-status]").textContent.includes("revealed"), "refresh cannot restore blind label");
+    check(!refreshed.requests.some(([route]) => route === "reveal"), "refresh does not request identities automatically");
+    refreshed.remove();
+    const flush = async () => {for (let i = 0; i < 30; i++) await Promise.resolve();};
+    const label = (test) => test.root.querySelector("[data-status]").textContent;
+    const server = {revealed: false};
+    const first = create({server}), second = create({server});
+    await Promise.all([first.controller.ready, second.controller.ready]);
+    await second.controller.toggle(); second.controller.switchSlot("B");
+    const schedule = JSON.stringify(second.calls), scope = second.root.querySelector("[data-scope]").textContent;
+    const selected = second.root.querySelector('[data-slot="B"]').getAttribute("aria-pressed");
+    let announcements = 0;
+    const observer = new MutationObserver((records) => {announcements += records.length;});
+    observer.observe(second.root.querySelector("[data-status]"), {childList: true});
+    second.focus(); await flush();
+    check(announcements === 0, "unchanged metadata does not announce status");
+    await first.controller.reveal();
+    second.timer(2000); await flush();
+    check(label(first).includes("revealed") && label(second).includes("revealed"), "two mounted clients reconcile permanent server Reveal");
+    check(announcements === 1, "reconciliation announces only the actual change");
+    check(JSON.stringify(second.calls) === schedule && second.root.querySelector("[data-scope]").textContent === scope &&
+      second.root.querySelector('[data-slot="B"]').getAttribute("aria-pressed") === selected, "reconciliation preserves source/gain schedule, selection and scope");
+    check(!second.requests.some(([route]) => route === "reveal") && !second.root.textContent.includes("a".repeat(32)), "anonymous reconciliation never loads identities");
+    observer.disconnect(); first.remove(); second.remove();
+
+    for (const event of ["focus", "visibility"]) {
+      const shared = {revealed: false}, test = create({server: shared});
+      await test.controller.ready;
+      if (event === "visibility") {
+        test.visibility("hidden");
+        check(test.timers.size === 0, "hidden page stops periodic refresh");
+        const count = test.requests.length; test.focus(); await flush();
+        check(test.requests.length === count, "hidden focus does not poll");
+      }
+      shared.revealed = true;
+      if (event === "visibility") test.visibility("visible");
+      else test.focus();
+      await flush();
+      check(label(test).includes("revealed"), `${event} reconciliation is monotonic`);
+      check(!test.requests.some(([route]) => route === "reveal"), `${event} does not request identities`);
+      test.remove(); check(test.timers.size === 0, "dispose clears scheduled refresh");
+      const after = test.requests.length; test.focus(); test.visibility("visible"); await flush();
+      check(test.requests.length === after, "dispose removes event listeners");
+    }
+    for (const postFailure of ["reject", "json"]) {
+      const options = {postFailure}, test = create(options); await test.controller.ready;
+      options.sessionResponse = async () => {throw new Error("offline");};
+      const revealing = test.controller.reveal();
+      check(label(test).includes("Reveal pending") && !label(test).includes("blind"), `${postFailure} pending immediately`);
+      await revealing; await flush();
+      check(label(test).includes("Reveal pending") && !label(test).includes("blind"), `${postFailure} committed but unknown never blind`);
+      options.sessionResponse = async (data) => ({ok: true, json: async () => ({...data, revealed: false})});
+      test.focus(); await flush();
+      check(!label(test).includes("blind"), "false check cannot clear potential Reveal");
+      delete options.sessionResponse; test.focus(); await flush();
+      check(label(test).includes("revealed"), `${postFailure} reconciles without retrying POST`);
+      check(test.requests.filter(([route]) => route === "reveal").length === 1, "no automatic POST retry");
+      test.remove();
+    }
+    const staleOptions = {}, stale = create(staleOptions); await stale.controller.ready;
+    let finish, signal;
+    staleOptions.sessionResponse = (data, abortSignal) => new Promise((resolve) => {
+      signal = abortSignal; finish = () => resolve({ok: true, json: async () => data});
+    });
+    stale.focus(); const inFlight = stale.requests.length;
+    stale.focus(); stale.visibility("visible");
+    check(stale.requests.length === inFlight, "metadata refresh is serialized during focus bursts");
+    await stale.controller.reveal(); finish(); await flush();
+    check(label(stale).includes("revealed"), "in-flight false cannot overwrite successful Reveal");
+    const delayedResponse = staleOptions.sessionResponse;
+    staleOptions.sessionResponse = async () => {throw new Error("offline");};
+    stale.focus(); await flush();
+    check(label(stale).includes("revealed"), "failed check cannot overwrite known Reveal");
+    staleOptions.sessionResponse = delayedResponse;
+    stale.focus(); const beforeDispose = label(stale), requestsBeforeDispose = stale.requests.length;
+    stale.remove(); check(signal.aborted && stale.timers.size === 0, "dispose aborts in-flight request and clears deadline");
+    finish(); await flush(); stale.focus(); stale.visibility("visible");
+    check(label(stale) === beforeDispose && stale.requests.length === requestsBeforeDispose && stale.timers.size === 0, "late response after disposal cannot update or restart refresh");
+
+    const failingOptions = {}, failing = create(failingOptions); await failing.controller.ready;
+    failingOptions.sessionResponse = (data, signal) => new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => reject(new Error("timeout")), {once: true});
+    });
+    failing.focus(); failing.timer(5000); await flush();
+    check(label(failing).includes("state unknown") && !label(failing).includes("blind"), "bounded failed check never asserts blinding");
+    delete failingOptions.sessionResponse; failing.timer(2000); await flush();
+    check(label(failing).includes("blind"), "successful check can restore confirmed blind before any Reveal attempt");
+    failing.remove();
+
+    let loaded;
+    const loadingServer = {revealed: false};
+    const loading = create({server: loadingServer, loadingGate: new Promise((resolve) => {loaded = resolve;})});
+    await flush(); loadingServer.revealed = true; loaded(); await loading.controller.ready;
+    check(label(loading).includes("Ready / revealed"), "delayed PCM completion reconciles initial false metadata before ready");
+    check(!loading.requests.some(([route]) => route === "reveal"), "loading reconciliation does not fetch identities");
+    check(loading.requests.every(([, init]) => init.cache === "no-store" && init.credentials === "omit"), "all requests remain anonymous no-store");
+    loading.remove();
+    // Visible synthetic production UI remains; keyboard Play also uses the recording context.
+    const manual = create(); await manual.controller.ready;
+    manual.root.insertAdjacentHTML("afterbegin", "<p><strong>Synthetic manual check only. No speaker is connected.</strong></p>");
+  } catch (error) { failed++; errors.push(String(error)); }
+  document.getElementById("results").textContent = `${passed} passed; ${failed} failed. ${errors.join("; ")}`;
+  document.documentElement.dataset.result = failed ? "failed" : "passed";
+})().catch(() => {
+  document.getElementById("results").textContent = "0 passed; 1 failed. Start the allowlisted local test server; do not open this file directly.";
+  document.documentElement.dataset.result = "failed";
+});
+</script>
+</html>

@@ -34,5 +34,7 @@ jobs:
           sudo apt-get install --yes --no-install-recommends ffmpeg
       - name: Verify portable audio jobs (synthetic audio, no models)
         run: uv run --no-sync python -B scripts/verify_audio_jobs.py
+      - name: Verify blind A/B preview (synthetic audio, no playback)
+        run: uv run --no-sync python -B scripts/verify_blind_ab.py
       - name: Build source distribution and wheel
         run: uv build

@@ -13,5 +13,8 @@ dynamic = ["dependencies"]
 [tool.setuptools]
 packages = ["songtool"]
 
+[tool.setuptools.package-data]
+songtool = ["blind_ab.html", "blind_ab.js"]
+
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}

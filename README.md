@@ -24,6 +24,34 @@ The historical sections below remain evidence about distinct artifacts, not a ca
 job lookup. The current trimmed raw track is a working baseline, not the older preferred
 master; accepted clips and the approved opening trim do not approve the whole song.
 
+## Temporary blind A/B preview (existing versions only)
+
+First explicitly select a job directory and read `job status JOB --json`. Resolve two
+exact registered IDs/hashes and their source maps, then select a common interval:
+
+```text
+python -B -m songtool job blind-ab JOB --version-one VERSION_ID --version-two OTHER_ID --source-start-frame FIRST --source-end-frame LAST
+```
+
+`[FIRST, LAST)` uses canonical-source **48 kHz frames**, not seconds or local offsets.
+The two IDs must differ; `current` is not accepted. Both versions must cover the exact
+scope: 1–2,880,000 frames (at most 60 seconds), never automatically shortened or shifted.
+This deliberate RAM-preview ceiling is not whole-song playback support.
+
+State the budget before real-media use: read-only A/B playback, CPU, no worker/model,
+maximum 60-second scope. Open the printed loopback URL manually; there is no autoplay.
+Play/Pause shares one audio clock; A/B switches preserve position. Replay keeps the same
+assignment. Reveal shows exact IDs/hashes and frame maps, permanently for that session;
+refresh cannot re-blind it. Stop the foreground command with Ctrl+C.
+
+Original files/job history stay untouched. There is no export, resampling export, gain
+matching, EQ, model execution/download, saved result or listening approval. Playback
+uses unadjusted float32 samples (including conversion from DOUBLE), not bit-perfect
+monitoring. Loudness differences remain audible; hard switches can click without proving
+version defects. This is neither ABX nor an approval mechanism.
+See [the A/B guide](docs/audio-workflow.md#temporary-blind-ab-preview) for limits and
+speaker-free checks. No real-media session was used to verify this feature.
+
 ## Latest listening copy — offset excerpt approved
 
 **Start here:** `E:\Projects\stranger\outputs\final\clarity-offset\song-offset.mp3`

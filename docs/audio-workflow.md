@@ -117,6 +117,88 @@ transitions outside. Impossible transition space stops the operation. Generic ou
 uses DOUBLE WAV and verifies decoded equality and transition guards; that is not the
 legacy PCM24 encoding guard. No speech-stem reinsertion or automatic repair loop.
 
+## Temporary blind A/B preview
+
+```text
+python -B -m songtool job status JOB --json
+python -B -m songtool job blind-ab JOB --version-one VERSION_ID --version-two OTHER_ID --source-start-frame FIRST --source-end-frame LAST
+```
+
+Before a real-media session, explicitly select `JOB`, read status, identify both exact
+version IDs/hashes and source maps, and state: **read-only A/B playback, CPU, no worker
+or model, maximum 60-second selected scope**. No directory or song is inferred. IDs
+must exist and differ; `current` and newest-file selection are rejected. Distinct IDs
+with identical samples are allowed as an identical-signal control without identifying it.
+
+`[FIRST, LAST)` is a half-open **canonical-source 48 kHz frame** interval, not seconds.
+Each file is read at local frame `FIRST - version.source_start_frame`, for exactly
+`LAST - FIRST` frames. Both maps must cover it; there is no correlation alignment,
+padding, truncation, automatic overlap, or inferred offset. The deliberate bounded
+preview supports 1 through 2,880,000 frames (60 seconds), about 46 MB for two stereo
+float32 PCM payloads before browser copies/validation overhead. Whole-song streaming
+is not implemented. Longer intervals fail rather than silently changing the selection.
+
+The command verifies existing job history/media and keeps only anonymous selected PCM
+and a randomized assignment in RAM. History verification can perform numerical FFmpeg
+checks, but no export, normalization, EQ, resampling export, render, worker, GPU, model
+execution or download is started. No job files, media, versions, runs, receipts,
+protected ranges, feedback, preferences or approvals are written.
+
+Open the printed opaque `127.0.0.1` URL manually in an existing Web Audio browser.
+There is no autoplay, desktop-player fallback or external asset. Both buffers must
+load before Play. The requested context is 48 kHz; unsupported rates fail rather than
+silently resampling buffers. Both sources start together with identical offset/duration;
+switching changes complementary gains on the same clock, never playback positions.
+Pause/resume uses one context. Replay creates a new pair with the same scope/assignment;
+there is no loop, seek, playlist or automatic repeated trial.
+
+Samples are **unadjusted float32**, including conversion of DOUBLE media only at the
+browser boundary. Originals remain byte-identical; browser/OS/device monitoring is
+not promised bit-perfect. Loudness differences remain audible. Hard switching can click;
+a transition artifact is not evidence that either version is defective or perceptually
+different. No crossfade, gain matching, limiter or other DSP hides these differences.
+
+Reveal is explicit, idempotent and one-way, exposing each slot's exact ID/hash, selected
+local/source interval, and version source offset. It changes no playback schedule or
+selection. Refresh preserves assignment and revealed state; press the identities button
+to display the mapping again. A fresh CLI invocation is a fresh session. Stop with Ctrl+C
+to close the socket and release server memory; close the browser tab to release its copy.
+No results, localStorage, service worker, saved trial history or session file is created.
+
+This is a private-local utility for cooperating users, not a hostile-upload/multi-user
+service or standardized ABX test. The capability URL, exact Host, same-origin Reveal
+POST, fixed routes, no-store headers and anonymous PCM prevent accidental identity
+exposure. They do not prevent the machine owner from deliberately fingerprinting
+waveforms, debugging memory or explicitly requesting Reveal. Browser-managed history
+is outside the tool's control; keep the temporary capability URL private.
+Playback/Reveal never mean “better”, “accepted”, “inaudible”, or whole-song approval.
+
+### Focused A/B verification
+
+Run only synthetic checks, with installed dependencies and no speaker playback:
+
+```text
+.venv/Scripts/python.exe -B scripts/verify_blind_ab.py
+.venv/Scripts/python.exe -B -m songtool job blind-ab --help
+.venv/Scripts/python.exe -B scripts/verify_blind_ab.py --browser
+```
+
+The last command serves only the framework-free assertion page and its two production
+assets. Open its printed local URL in the existing browser (do not open the HTML as a
+`file:` URL); the page displays passed/failed counts. Ctrl+C stops the test server.
+Its injected recording AudioContext never connects to a speaker. The visible final
+synthetic preview supports manual Tab/Enter/Space selection, Play/Pause and Reveal checks.
+Check visible keyboard focus, 200% zoom, 320px reflow, wrapping long IDs, and readable
+error states. The controller is the production implementation, not a second test player.
+
+Implementation verification: focused Python checks passed; installed Chrome reported
+120 passed, 0 failed browser assertions. Desktop and 320px revealed layouts were visually
+inspected using synthetic data. Keyboard-only, zoom, assistive-technology and actual
+hardware/listening behavior remain unverified; no accessibility conformance or perceptual
+approval is claimed. No real job, prior operation trial or full-song render was run.
+Static assets use package resources and are explicitly included in package-data config;
+configuration/resource checks are separate from a package build.
+
 ## Status-first agent rule and retries
 
 Before acting, read status, resolve the exact current and intended parent IDs/hashes,
