@@ -1,7 +1,7 @@
 # Install torch/torchaudio from the CUDA 11.8 index first; see README.md.
 torch==2.7.1
 torchaudio==2.7.1
-numpy==2.5.3
+numpy==2.5.4
 soundfile==0.14.0
 librosa==1.0.0
 pytorch-lightning==2.6.5
